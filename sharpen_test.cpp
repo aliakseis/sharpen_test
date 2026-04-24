@@ -268,33 +268,47 @@ void shiftPSF(const Mat& src, Mat& dst)
 //---------------------------------------------
 // 4. Обратный фильтр из PSF
 //---------------------------------------------
-Mat buildInverseFilterFromPSF(const Mat& psfSmall, Size imgSize, float eps = 1e-3f)
+Mat buildInverseFilterFromPSF(const Mat& psfSmall, Size imgSize, float K = 0.01f)
 {
+    // --- 1. Pad PSF to image size ---
     Mat psfPadded(imgSize, CV_32F, Scalar(0));
     int x0 = (imgSize.width - psfSmall.cols) / 2;
     int y0 = (imgSize.height - psfSmall.rows) / 2;
     psfSmall.copyTo(psfPadded(Rect(x0, y0, psfSmall.cols, psfSmall.rows)));
 
+    // --- 2. Shift PSF so center is at (0,0) ---
     Mat psfShifted;
     shiftPSF(psfPadded, psfShifted);
 
+    // --- 3. Forward DFT of PSF ---
     Mat planesH[] = { psfShifted.clone(), Mat::zeros(imgSize, CV_32F) };
     Mat H;
     merge(planesH, 2, H);
     dft(H, H, DFT_COMPLEX_OUTPUT);
 
+    // --- 4. Split into real/imag ---
     Mat planes[2];
     split(H, planes);
     Mat Re = planes[0];
     Mat Im = planes[1];
 
+    // --- 5. Compute |H|^2 ---
     Mat mag2;
     magnitude(Re, Im, mag2);
     mag2 = mag2.mul(mag2);
 
-    Mat G_re = Re / (mag2 + eps);
-    Mat G_im = -Im / (mag2 + eps);
+    // --- 6. Robust Wiener denominator ---
+    // Adaptive scaling makes K stable across images
+    Scalar meanMag = mean(mag2);
+    float adaptiveK = K * static_cast<float>(meanMag[0] + 1e-8f);
 
+    Mat denom = mag2 + adaptiveK;
+
+    // --- 7. Wiener filter: H* / (|H|^2 + K) ---
+    Mat G_re = Re / denom;
+    Mat G_im = -Im / denom;
+
+    // --- 8. Merge back ---
     Mat G;
     Mat planesG[] = { G_re, G_im };
     merge(planesG, 2, G);
@@ -391,7 +405,7 @@ int main(int argc, char** argv)
     //*/
 
     // 3. Обратный фильтр
-    Mat G = buildInverseFilterFromPSF(psf, Y.size(), 1e-3f);
+    Mat G = buildInverseFilterFromPSF(psf, Y.size(), 0.1f);
 
     // 4. Деконволюция Y
     Mat Y_restored = applyFilterDFT(Y, G);
