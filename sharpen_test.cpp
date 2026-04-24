@@ -77,7 +77,13 @@ Mat computeMaxDiffMatrix(const Mat& gray, int radius)
         }
     }
 
-    return M;
+    //return M;
+    double minVal, maxVal;
+    minMaxLoc(M, &minVal, &maxVal);
+
+    Mat P = (maxVal - M) / (maxVal - minVal); // 0..1
+
+    return P;
 }
 
 Mat applyRadialHann(const Mat& P)
@@ -271,6 +277,8 @@ Mat computeCorrelationFFT(const Mat& gray, int radius)
     Mat cropped = shifted(Rect(cx - radius, cy - radius,
         2 * radius + 1, 2 * radius + 1)).clone();
 
+    //GaussianBlur(cropped, cropped, Size(3, 3), 1.0);
+
     // --- 7. Normalize for stability ---
     normalize(cropped, cropped, 0, 1, NORM_MINMAX);
 
@@ -283,14 +291,14 @@ Mat computeCorrelationFFT(const Mat& gray, int radius)
 Mat buildPSFFromM(const Mat& M)
 {
     CV_Assert(M.type() == CV_32F);
-    double minVal, maxVal;
-    minMaxLoc(M, &minVal, &maxVal);
+    //double minVal, maxVal;
+    //minMaxLoc(M, &minVal, &maxVal);
 
-    Mat P = (M - minVal) / (maxVal - minVal); // 0..1
+    //Mat P = (M - minVal) / (maxVal - minVal); // 0..1
     //P = 1.0f - P;                             // центр=1, края=0
 
 
-    P = clipPSFByHeap(P);
+    Mat P = clipPSFByHeap(M);
 
     P = cropPSFToActiveRegionAndFixOdd(P);
 
@@ -412,8 +420,9 @@ int main(int argc, char** argv)
 
     // 1. M(dx,dy) по Y
     //Mat M = computeMaxDiffMatrix(Y, radius);
-
     Mat M = computeCorrelationFFT(Y, radius);
+
+    //Mat M = computeMaxDiffMatrix(Y, radius) + computeCorrelationFFT(Y, radius);
 
     std::cout << "M:\n";
     for (int y = 0; y < M.rows; ++y)
