@@ -13,9 +13,9 @@ Mat computeMaxDiffMatrix(const Mat& gray, int radius)
 
     const int border = 2; // отступ от краёв для безопасного доступа к пикселям
 
-    const int num_vals = 30;
+    //const int num_vals = 30;
 
-    int nth = (gray.rows + gray.cols) / 4 + num_vals; // примерное значение, можно настроить
+    int nth = (gray.rows * gray.cols) / 100; // примерное значение, можно настроить
 
     Mat M(K, K, CV_32F, Scalar(0));
 
@@ -44,8 +44,9 @@ Mat computeMaxDiffMatrix(const Mat& gray, int radius)
 
                 for (int x = xStart; x < xEnd; ++x)
                 {
-                    float d = float(row1[x]) - float(row2[x + dx]);
-                    if (d > 0)
+                    //float d = float(row1[x]) - float(row2[x + dx]);
+                    //if (d > 0)
+                    float d = std::abs(float(row1[x]) - float(row2[x + dx]));
                     {
                         // добавляем в heap
                         if ((int)heap.size() < nth)
@@ -66,7 +67,7 @@ Mat computeMaxDiffMatrix(const Mat& gray, int radius)
 
             int count = 0;
             float nthMax = 0.0f;
-            while (count < num_vals && !heap.empty())
+            while (!heap.empty())
             {
                 nthMax += heap.top();
                 heap.pop();
