@@ -62,8 +62,8 @@ Mat computeMaxDiffMatrix(const Mat& gray, int radius)
                 }
             }
 
-            if (heap.size() < nth)
-                std::cerr << "Warning: only " << heap.size() << " values for offset (" << dx << "," << dy << ")\n";
+            //if (heap.size() < nth)
+            //    std::cerr << "Warning: only " << heap.size() << " values for offset (" << dx << "," << dy << ")\n";
 
             int count = 0;
             float nthMax = 0.0f;
@@ -252,6 +252,16 @@ Mat computeCorrelationFFT(const Mat& gray, int radius)
     gray.convertTo(f32, CV_32F);
     f32 -= mean(f32)[0];   // VERY IMPORTANT
 
+
+    Mat gx, gy;
+    Sobel(f32, gx, CV_32F, 1, 0, 3);
+    Sobel(f32, gy, CV_32F, 0, 1, 3);
+
+    Mat grad;
+    magnitude(gx, gy, grad);
+
+    threshold(grad, f32, 10.0f, 0.0f, THRESH_TOZERO);
+
     // --- 2. Forward DFT ---
     Mat planes[] = { f32, Mat::zeros(f32.size(), CV_32F) };
     Mat F;
@@ -304,7 +314,7 @@ Mat buildPSFFromM(const Mat& M)
 
     //P = applyRadialHann(P);                   // прижимаем края к 0
 
-    //GaussianBlur(P, P, Size(3, 3), 1.0);       // сглаживание
+    //GaussianBlur(P, P, Size(5, 5), 1.0);       // сглаживание
 
     //pow(P, 2.0, P);                           // gamma correction
 
@@ -420,9 +430,9 @@ int main(int argc, char** argv)
 
     // 1. M(dx,dy) по Y
     //Mat M = computeMaxDiffMatrix(Y, radius);
-    Mat M = computeCorrelationFFT(Y, radius);
+    //Mat M = computeCorrelationFFT(Y, radius);
 
-    //Mat M = computeMaxDiffMatrix(Y, radius) + computeCorrelationFFT(Y, radius);
+    Mat M = computeMaxDiffMatrix(Y, radius) + computeCorrelationFFT(Y, radius);
 
     std::cout << "M:\n";
     for (int y = 0; y < M.rows; ++y)
