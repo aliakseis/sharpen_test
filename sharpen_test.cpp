@@ -212,36 +212,6 @@ Mat cropPSFToActiveRegionAndFixOdd(const Mat& psf)
 
 
 //---------------------------------------------
-// 2. PSF из матрицы M: PSF ≈ max(M) - M, нормировка
-//---------------------------------------------
-Mat buildPSFFromM(const Mat& M)
-{
-    CV_Assert(M.type() == CV_32F);
-    double minVal, maxVal;
-    minMaxLoc(M, &minVal, &maxVal);
-
-    Mat P = (M - minVal) / (maxVal - minVal); // 0..1
-    P = 1.0f - P;                             // центр=1, края=0
-
-
-    P = clipPSFByHeap(P);
-
-    P = cropPSFToActiveRegionAndFixOdd(P);
-
-    //P = applyRadialHann(P);                   // прижимаем края к 0
-
-    //GaussianBlur(P, P, Size(3, 3), 1.0);       // сглаживание
-
-    //pow(P, 2.0, P);                           // gamma correction
-
-    Scalar s = sum(P);
-    if (s[0] > 1e-6)
-        P /= s[0];                            // нормировка суммы
-
-    return P;
-}
-
-//---------------------------------------------
 // 3. Сдвиг PSF (центр → (0,0))
 //---------------------------------------------
 void shiftPSF(const Mat& src, Mat& dst)
@@ -264,6 +234,77 @@ void shiftPSF(const Mat& src, Mat& dst)
     q2.copyTo(d1);
     q1.copyTo(d2);
     q0.copyTo(d3);
+}
+
+
+Mat computeCorrelationFFT(const Mat& gray, int radius)
+{
+    CV_Assert(gray.type() == CV_8U);
+
+    // --- 1. Convert to float and remove DC ---
+    Mat f32;
+    gray.convertTo(f32, CV_32F);
+    f32 -= mean(f32)[0];   // VERY IMPORTANT
+
+    // --- 2. Forward DFT ---
+    Mat planes[] = { f32, Mat::zeros(f32.size(), CV_32F) };
+    Mat F;
+    merge(planes, 2, F);
+    dft(F, F);
+
+    // --- 3. Multiply by conjugate (|F|^2 but in complex form) ---
+    Mat Fc;
+    mulSpectrums(F, F, Fc, 0, true);  // conjB = true
+
+    // --- 4. Inverse DFT → correlation ---
+    Mat C;
+    idft(Fc, C, DFT_REAL_OUTPUT | DFT_SCALE);
+
+    // --- 5. Shift zero-frequency to center ---
+    Mat shifted;
+    shiftPSF(C, shifted);
+
+    // --- 6. Crop around center ---
+    int cx = shifted.cols / 2;
+    int cy = shifted.rows / 2;
+
+    Mat cropped = shifted(Rect(cx - radius, cy - radius,
+        2 * radius + 1, 2 * radius + 1)).clone();
+
+    // --- 7. Normalize for stability ---
+    normalize(cropped, cropped, 0, 1, NORM_MINMAX);
+
+    return cropped;
+}
+
+//---------------------------------------------
+// 2. PSF из матрицы M: PSF ≈ max(M) - M, нормировка
+//---------------------------------------------
+Mat buildPSFFromM(const Mat& M)
+{
+    CV_Assert(M.type() == CV_32F);
+    double minVal, maxVal;
+    minMaxLoc(M, &minVal, &maxVal);
+
+    Mat P = (M - minVal) / (maxVal - minVal); // 0..1
+    //P = 1.0f - P;                             // центр=1, края=0
+
+
+    P = clipPSFByHeap(P);
+
+    P = cropPSFToActiveRegionAndFixOdd(P);
+
+    //P = applyRadialHann(P);                   // прижимаем края к 0
+
+    //GaussianBlur(P, P, Size(3, 3), 1.0);       // сглаживание
+
+    //pow(P, 2.0, P);                           // gamma correction
+
+    Scalar s = sum(P);
+    if (s[0] > 1e-6)
+        P /= s[0];                            // нормировка суммы
+
+    return P;
 }
 
 //---------------------------------------------
@@ -370,7 +411,9 @@ int main(int argc, char** argv)
     const int radius = 15;
 
     // 1. M(dx,dy) по Y
-    Mat M = computeMaxDiffMatrix(Y, radius);
+    //Mat M = computeMaxDiffMatrix(Y, radius);
+
+    Mat M = computeCorrelationFFT(Y, radius);
 
     std::cout << "M:\n";
     for (int y = 0; y < M.rows; ++y)
