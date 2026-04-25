@@ -384,10 +384,60 @@ Mat applyFilterDFT(const Mat& gray, const Mat& G)
     Mat f32;
     gray.convertTo(f32, CV_32F);
 
-    Mat planesF[] = { f32, Mat::zeros(gray.size(), CV_32F) };
+    //------------------------------------------------------------
+    // Forward complex DFT
+    //------------------------------------------------------------
     Mat F;
-    merge(planesF, 2, F);
-    dft(F, F, DFT_COMPLEX_OUTPUT);
+    {
+        Mat planes0[] = { f32, Mat::zeros(f32.size(), CV_32F) };
+        merge(planes0, 2, F);
+        dft(F, F, DFT_COMPLEX_OUTPUT);
+    }
+
+    //------------------------------------------------------------
+    // Split real/imaginary channels
+    //------------------------------------------------------------
+    Mat planes[2];
+    split(F, planes);
+
+    Mat& Re = planes[0];
+    Mat& Im = planes[1];
+
+    //------------------------------------------------------------
+    // Quantization-only spectral radial shrink
+    //------------------------------------------------------------
+
+    // Spatial quantization variance for integer 8-bit rounding
+    const float sigma2_spatial = 1.0f / 12.0f;
+
+    // Variance of one Fourier coefficient axis (Re or Im)
+    const float sigma2_axis = sigma2_spatial * static_cast<float>(gray.total()) * 0.5f;
+
+    // mag2 = Re^2 + Im^2
+    Mat mag2 = Re.mul(Re);
+    mag2 += Im.mul(Im);
+
+    // alpha = max(1 - sigma2_axis / mag2, 0)
+    Mat alpha;
+    divide(sigma2_axis, mag2 + 1e-12f, alpha);
+    alpha = 1.0f - alpha;
+    max(alpha, 0, alpha);
+
+    // in-place shrink of complex coefficient
+    multiply(Re, alpha, Re);
+    multiply(Im, alpha, Im);
+
+    // preserve DC exactly
+    Re.at<float>(0, 0) = F.at<Vec2f>(0, 0)[0];
+    Im.at<float>(0, 0) = F.at<Vec2f>(0, 0)[1];
+
+    //------------------------------------------------------------
+    // Merge back
+    //------------------------------------------------------------
+    //Mat Fclean;
+    //merge(planes, 2, Fclean);
+
+    merge(planes, 2, F);
 
     Mat Y;
     mulSpectrums(F, G, Y, 0);
