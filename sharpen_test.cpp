@@ -404,6 +404,9 @@ Mat applyFilterDFT(const Mat& gray, const Mat& G)
         Mat& Re = planes[0];
         Mat& Im = planes[1];
 
+        const float dcRe = Re.at<float>(0, 0);
+        const float dcIm = Im.at<float>(0, 0);
+
         //------------------------------------------------------------
         // Quantization-only spectral radial shrink
         //------------------------------------------------------------
@@ -412,7 +415,7 @@ Mat applyFilterDFT(const Mat& gray, const Mat& G)
         const float sigma2_spatial = 1.0f / 12.0f;
 
         // Variance of one Fourier coefficient axis (Re or Im)
-        const float sigma2_axis = sigma2_spatial * static_cast<float>(gray.total()) * 0.5f;
+        const float sigma2_axis = sigma2_spatial * static_cast<float>(Re.total()) * 0.5f;
 
         // mag2 = Re^2 + Im^2
         Mat mag2 = Re.mul(Re);
@@ -429,8 +432,8 @@ Mat applyFilterDFT(const Mat& gray, const Mat& G)
         multiply(Im, alpha, Im);
 
         // preserve DC exactly
-        Re.at<float>(0, 0) = F.at<Vec2f>(0, 0)[0];
-        Im.at<float>(0, 0) = F.at<Vec2f>(0, 0)[1];
+        Re.at<float>(0, 0) = dcRe;
+        Im.at<float>(0, 0) = dcIm;
 
         //------------------------------------------------------------
         // Merge back
@@ -438,8 +441,8 @@ Mat applyFilterDFT(const Mat& gray, const Mat& G)
         //Mat Fclean;
         //merge(planes, 2, Fclean);
 
-        merge(planes, 2, F);
     }
+    merge(planes, 2, F);
 
     Mat Y;
     mulSpectrums(F, G, Y, 0);
