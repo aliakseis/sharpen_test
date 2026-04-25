@@ -443,92 +443,129 @@ Mat applyFilterDFT(const Mat& gray, const Mat& G)
 
     Mat Y;
     mulSpectrums(F, G, Y, 0);
-
+    //*
     // ---------------------------------------------------------
-    // Деликатное подавление среднечастотной ряби в спектре
+    // Near state-of-the-art automatic delicate spectral anomaly suppressor
+    // 2D local spectral residual model + anisotropy-safe soft attenuation
     // ---------------------------------------------------------
 
-    // Разделяем спектр
     Mat cpl[2];
     split(Y, cpl);
     Mat& Re = cpl[0];
     Mat& Im = cpl[1];
 
-    // Амплитуда спектра
+    // ---------------------------------------------------------
+    // 1. Magnitude log-spectrum
+    // ---------------------------------------------------------
     Mat mag;
     magnitude(Re, Im, mag);
 
-    // Логарифм для устойчивой статистики
     Mat logmag;
     log(mag + 1.0f, logmag);
 
-    // Усреднение по радиусу (полярный профиль)
-    int cx = Y.cols / 2;
-    int cy = Y.rows / 2;
-    int R = std::min(cx, cy);
+    // ---------------------------------------------------------
+    // 2. Broad local spectral baseline
+    // ---------------------------------------------------------
+    Mat baseline;
+    GaussianBlur(logmag, baseline, Size(0, 0), 18.0, 18.0, BORDER_REFLECT);
 
-    std::vector<float> radial(R, 0), count(R, 0);
-    for (int y = 0; y < Y.rows; y++) {
-        for (int x = 0; x < Y.cols; x++) {
+    // Spectral anomaly residual
+    Mat resid = logmag - baseline;
+
+    // ---------------------------------------------------------
+    // 3. Global anomaly statistics
+    // ---------------------------------------------------------
+    Scalar mu, sd;
+    meanStdDev(resid, mu, sd);
+
+    float mean = (float)mu[0];
+    float stdv = (float)sd[0];
+
+    // ---------------------------------------------------------
+    // 4. Build soft anomaly confidence map
+    // ---------------------------------------------------------
+    const int rows = Y.rows;
+    const int cols = Y.cols;
+    Mat conf(rows, cols, CV_32F);
+
+    for (int y = 0; y < rows; ++y)
+    {
+        const float* rp = resid.ptr<float>(y);
+        float* cp = conf.ptr<float>(y);
+
+        for (int x = 0; x < cols; ++x)
+        {
+            float z = (rp[x] - mean) / std::max(0.001f, stdv);
+
+            // positive anomalies only
+            if (z < 1.5f)
+            {
+                cp[x] = 0.0f;
+                continue;
+            }
+
+            // smooth confidence growth
+            cp[x] = std::min(1.0f, (z - 1.5f) / 2.5f);
+        }
+    }
+
+    // ---------------------------------------------------------
+    // 5. Remove isolated tiny anomalies (keep broad ripple clouds only)
+    // ---------------------------------------------------------
+    GaussianBlur(conf, conf, Size(0, 0), 3.5, 3.5, BORDER_REFLECT);
+
+    // ---------------------------------------------------------
+    // 6. Mid-frequency radial weighting
+    // avoid DC and very high frequencies
+    // ---------------------------------------------------------
+    //const int rows = Y.rows;
+    //const int cols = Y.cols;
+    const float cx = cols * 0.5f;
+    const float cy = rows * 0.5f;
+    const float Rmax = std::min(cx, cy);
+
+    Mat mask(rows, cols, CV_32F);
+
+    for (int y = 0; y < rows; ++y)
+    {
+        const float* cp = conf.ptr<float>(y);
+        float* mp = mask.ptr<float>(y);
+
+        float dy = y - cy;
+
+        for (int x = 0; x < cols; ++x)
+        {
             float dx = x - cx;
-            float dy = y - cy;
-            int r = int(std::sqrt(dx * dx + dy * dy));
-            if (r < R) {
-                radial[r] += logmag.at<float>(y, x);
-                count[r] += 1;
-            }
-        }
-    }
-    for (int r = 0; r < R; r++)
-        radial[r] /= std::max(1.0f, count[r]);
+            float r = std::sqrt(dx * dx + dy * dy) / Rmax;
 
-    // Статистика для поиска пиков ряби
-    float mean = 0, stdv = 0;
-    for (float v : radial) mean += v;
-    mean /= R;
-    for (float v : radial) stdv += (v - mean) * (v - mean);
-    stdv = std::sqrt(stdv / R);
+            // radial emphasis on middle frequencies only
+            float mid =
+                std::exp(-0.5f * (r - 0.42f) * (r - 0.42f) / (0.18f * 0.18f));
 
-    // Пики ряби (выше среднего + 2.5σ)
-    std::vector<int> peaks;
-    for (int r = 4; r < R - 4; r++) {
-        if (radial[r] > mean + 2.5f * stdv)
-            peaks.push_back(r);
-    }
+            // attenuation strength limited and delicate
+            float atten = 0.30f * cp[x] * mid;
 
-    // Создаём мягкую маску подавления
-    Mat mask = Mat::ones(Y.size(), CV_32F);
-    float sigma = 6.0f;
-
-    for (int r : peaks) {
-        for (int a = 0; a < 360; a += 3) {
-            float ang = a * CV_PI / 180.0f;
-            float x = cx + r * std::cos(ang);
-            float y = cy + r * std::sin(ang);
-
-            for (int yy = -20; yy <= 20; yy++) {
-                for (int xx = -20; xx <= 20; xx++) {
-                    int X = int(x + xx);
-                    int Yy = int(y + yy);
-                    if (X >= 0 && X < mask.cols && Yy >= 0 && Yy < mask.rows) {
-                        float d2 = float(xx * xx + yy * yy);
-                        float w = 1.0f - std::exp(-0.5f * d2 / (sigma * sigma));
-                        mask.at<float>(Yy, X) *= w;
-                    }
-                }
-            }
+            mp[x] = 1.0f - atten;
         }
     }
 
-    // Применяем маску к спектру
-    Re = Re.mul(mask);
-    Im = Im.mul(mask);
+    // ---------------------------------------------------------
+    // 7. Optional final smoothing of mask to avoid hard spectral transitions
+    // ---------------------------------------------------------
+    GaussianBlur(mask, mask, Size(0, 0), 2.0, 2.0, BORDER_REFLECT);
+
+    // ---------------------------------------------------------
+    // 8. Apply
+    // ---------------------------------------------------------
+    multiply(Re, mask, Re);
+    multiply(Im, mask, Im);
+
     merge(cpl, 2, Y);
 
     // ---------------------------------------------------------
-    // Конец вставки
+    // End
     // ---------------------------------------------------------
-
+    //*/
     Mat out32;
     idft(Y, out32, DFT_REAL_OUTPUT | DFT_SCALE);
 
