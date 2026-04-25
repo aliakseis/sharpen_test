@@ -376,6 +376,49 @@ Mat buildInverseFilterFromPSF(const Mat& psfSmall, Size imgSize, float K = 0.01f
     return G;
 }
 
+void DeQuantization(cv::Mat*  planes)
+{
+    Mat& Re = planes[0];
+    Mat& Im = planes[1];
+
+    const float dcRe = Re.at<float>(0, 0);
+    const float dcIm = Im.at<float>(0, 0);
+
+    //------------------------------------------------------------
+    // Quantization-only spectral radial shrink
+    //------------------------------------------------------------
+
+    // Spatial quantization variance for integer 8-bit rounding
+    const float sigma2_spatial = 1.0f / 12.0f;
+
+    // Variance of one Fourier coefficient axis (Re or Im)
+    const float sigma2_axis = sigma2_spatial * static_cast<float>(Re.total()) * 0.5f;
+
+    // mag2 = Re^2 + Im^2
+    Mat mag2 = Re.mul(Re);
+    mag2 += Im.mul(Im);
+
+    // alpha = max(1 - sigma2_axis / mag2, 0)
+    Mat alpha;
+    divide(sigma2_axis, mag2 + 1e-12f, alpha);
+    alpha = 1.0f - alpha;
+    max(alpha, 0, alpha);
+
+    // in-place shrink of complex coefficient
+    multiply(Re, alpha, Re);
+    multiply(Im, alpha, Im);
+
+    // preserve DC exactly
+    Re.at<float>(0, 0) = dcRe;
+    Im.at<float>(0, 0) = dcIm;
+
+    //------------------------------------------------------------
+    // Merge back
+    //------------------------------------------------------------
+    //Mat Fclean;
+    //merge(planes, 2, Fclean);
+}
+
 //---------------------------------------------
 // 5. Применение фильтра к одному каналу
 //---------------------------------------------
@@ -400,48 +443,7 @@ Mat applyFilterDFT(const Mat& gray, const Mat& G)
     Mat planes[2];
     split(F, planes);
 
-    {
-        Mat& Re = planes[0];
-        Mat& Im = planes[1];
-
-        const float dcRe = Re.at<float>(0, 0);
-        const float dcIm = Im.at<float>(0, 0);
-
-        //------------------------------------------------------------
-        // Quantization-only spectral radial shrink
-        //------------------------------------------------------------
-
-        // Spatial quantization variance for integer 8-bit rounding
-        const float sigma2_spatial = 1.0f / 12.0f;
-
-        // Variance of one Fourier coefficient axis (Re or Im)
-        const float sigma2_axis = sigma2_spatial * static_cast<float>(Re.total()) * 0.5f;
-
-        // mag2 = Re^2 + Im^2
-        Mat mag2 = Re.mul(Re);
-        mag2 += Im.mul(Im);
-
-        // alpha = max(1 - sigma2_axis / mag2, 0)
-        Mat alpha;
-        divide(sigma2_axis, mag2 + 1e-12f, alpha);
-        alpha = 1.0f - alpha;
-        max(alpha, 0, alpha);
-
-        // in-place shrink of complex coefficient
-        multiply(Re, alpha, Re);
-        multiply(Im, alpha, Im);
-
-        // preserve DC exactly
-        Re.at<float>(0, 0) = dcRe;
-        Im.at<float>(0, 0) = dcIm;
-
-        //------------------------------------------------------------
-        // Merge back
-        //------------------------------------------------------------
-        //Mat Fclean;
-        //merge(planes, 2, Fclean);
-
-    }
+    DeQuantization(planes);
     merge(planes, 2, F);
 
     Mat Y;
@@ -454,6 +456,9 @@ Mat applyFilterDFT(const Mat& gray, const Mat& G)
 
     Mat cpl[2];
     split(Y, cpl);
+
+    DeQuantization(cpl);
+
     Mat& Re = cpl[0];
     Mat& Im = cpl[1];
 
@@ -483,6 +488,8 @@ Mat applyFilterDFT(const Mat& gray, const Mat& G)
 
     float mean = (float)mu[0];
     float stdv = (float)sd[0];
+
+    //std::cout << "Residual mean: " << mean << ", stddev: " << stdv << "\n";
 
     // ---------------------------------------------------------
     // 4. Build soft anomaly confidence map
