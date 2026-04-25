@@ -400,47 +400,134 @@ Mat applyFilterDFT(const Mat& gray, const Mat& G)
     Mat planes[2];
     split(F, planes);
 
-    Mat& Re = planes[0];
-    Mat& Im = planes[1];
+    {
+        Mat& Re = planes[0];
+        Mat& Im = planes[1];
 
-    //------------------------------------------------------------
-    // Quantization-only spectral radial shrink
-    //------------------------------------------------------------
+        //------------------------------------------------------------
+        // Quantization-only spectral radial shrink
+        //------------------------------------------------------------
 
-    // Spatial quantization variance for integer 8-bit rounding
-    const float sigma2_spatial = 1.0f / 12.0f;
+        // Spatial quantization variance for integer 8-bit rounding
+        const float sigma2_spatial = 1.0f / 12.0f;
 
-    // Variance of one Fourier coefficient axis (Re or Im)
-    const float sigma2_axis = sigma2_spatial * static_cast<float>(gray.total()) * 0.5f;
+        // Variance of one Fourier coefficient axis (Re or Im)
+        const float sigma2_axis = sigma2_spatial * static_cast<float>(gray.total()) * 0.5f;
 
-    // mag2 = Re^2 + Im^2
-    Mat mag2 = Re.mul(Re);
-    mag2 += Im.mul(Im);
+        // mag2 = Re^2 + Im^2
+        Mat mag2 = Re.mul(Re);
+        mag2 += Im.mul(Im);
 
-    // alpha = max(1 - sigma2_axis / mag2, 0)
-    Mat alpha;
-    divide(sigma2_axis, mag2 + 1e-12f, alpha);
-    alpha = 1.0f - alpha;
-    max(alpha, 0, alpha);
+        // alpha = max(1 - sigma2_axis / mag2, 0)
+        Mat alpha;
+        divide(sigma2_axis, mag2 + 1e-12f, alpha);
+        alpha = 1.0f - alpha;
+        max(alpha, 0, alpha);
 
-    // in-place shrink of complex coefficient
-    multiply(Re, alpha, Re);
-    multiply(Im, alpha, Im);
+        // in-place shrink of complex coefficient
+        multiply(Re, alpha, Re);
+        multiply(Im, alpha, Im);
 
-    // preserve DC exactly
-    Re.at<float>(0, 0) = F.at<Vec2f>(0, 0)[0];
-    Im.at<float>(0, 0) = F.at<Vec2f>(0, 0)[1];
+        // preserve DC exactly
+        Re.at<float>(0, 0) = F.at<Vec2f>(0, 0)[0];
+        Im.at<float>(0, 0) = F.at<Vec2f>(0, 0)[1];
 
-    //------------------------------------------------------------
-    // Merge back
-    //------------------------------------------------------------
-    //Mat Fclean;
-    //merge(planes, 2, Fclean);
+        //------------------------------------------------------------
+        // Merge back
+        //------------------------------------------------------------
+        //Mat Fclean;
+        //merge(planes, 2, Fclean);
 
-    merge(planes, 2, F);
+        merge(planes, 2, F);
+    }
 
     Mat Y;
     mulSpectrums(F, G, Y, 0);
+
+    // ---------------------------------------------------------
+    // Деликатное подавление среднечастотной ряби в спектре
+    // ---------------------------------------------------------
+
+    // Разделяем спектр
+    Mat cpl[2];
+    split(Y, cpl);
+    Mat& Re = cpl[0];
+    Mat& Im = cpl[1];
+
+    // Амплитуда спектра
+    Mat mag;
+    magnitude(Re, Im, mag);
+
+    // Логарифм для устойчивой статистики
+    Mat logmag;
+    log(mag + 1.0f, logmag);
+
+    // Усреднение по радиусу (полярный профиль)
+    int cx = Y.cols / 2;
+    int cy = Y.rows / 2;
+    int R = std::min(cx, cy);
+
+    std::vector<float> radial(R, 0), count(R, 0);
+    for (int y = 0; y < Y.rows; y++) {
+        for (int x = 0; x < Y.cols; x++) {
+            float dx = x - cx;
+            float dy = y - cy;
+            int r = int(std::sqrt(dx * dx + dy * dy));
+            if (r < R) {
+                radial[r] += logmag.at<float>(y, x);
+                count[r] += 1;
+            }
+        }
+    }
+    for (int r = 0; r < R; r++)
+        radial[r] /= std::max(1.0f, count[r]);
+
+    // Статистика для поиска пиков ряби
+    float mean = 0, stdv = 0;
+    for (float v : radial) mean += v;
+    mean /= R;
+    for (float v : radial) stdv += (v - mean) * (v - mean);
+    stdv = std::sqrt(stdv / R);
+
+    // Пики ряби (выше среднего + 2.5σ)
+    std::vector<int> peaks;
+    for (int r = 4; r < R - 4; r++) {
+        if (radial[r] > mean + 2.5f * stdv)
+            peaks.push_back(r);
+    }
+
+    // Создаём мягкую маску подавления
+    Mat mask = Mat::ones(Y.size(), CV_32F);
+    float sigma = 6.0f;
+
+    for (int r : peaks) {
+        for (int a = 0; a < 360; a += 3) {
+            float ang = a * CV_PI / 180.0f;
+            float x = cx + r * std::cos(ang);
+            float y = cy + r * std::sin(ang);
+
+            for (int yy = -20; yy <= 20; yy++) {
+                for (int xx = -20; xx <= 20; xx++) {
+                    int X = int(x + xx);
+                    int Yy = int(y + yy);
+                    if (X >= 0 && X < mask.cols && Yy >= 0 && Yy < mask.rows) {
+                        float d2 = float(xx * xx + yy * yy);
+                        float w = 1.0f - std::exp(-0.5f * d2 / (sigma * sigma));
+                        mask.at<float>(Yy, X) *= w;
+                    }
+                }
+            }
+        }
+    }
+
+    // Применяем маску к спектру
+    Re = Re.mul(mask);
+    Im = Im.mul(mask);
+    merge(cpl, 2, Y);
+
+    // ---------------------------------------------------------
+    // Конец вставки
+    // ---------------------------------------------------------
 
     Mat out32;
     idft(Y, out32, DFT_REAL_OUTPUT | DFT_SCALE);
