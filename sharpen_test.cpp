@@ -83,6 +83,10 @@ Mat computeMaxDiffMatrix(const Mat& gray, int radius)
 
     Mat P = (maxVal - M) / (maxVal - minVal); // 0..1
 
+    Scalar s = sum(P);
+    if (s[0] > 1e-6)
+        P /= s[0];                            // нормировка суммы
+
     return P;
 }
 
@@ -292,6 +296,10 @@ Mat computeCorrelationFFT(const Mat& gray, int radius)
 
     // --- 7. Normalize for stability ---
     normalize(cropped, cropped, 0, 1, NORM_MINMAX);
+
+    Scalar s = sum(cropped);
+    if (s[0] > 1e-6)
+        cropped /= s[0];                            // нормировка суммы
 
     return cropped;
 }
