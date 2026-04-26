@@ -622,6 +622,35 @@ int main(int argc, char** argv)
     Mat Cr = ch[1];
     Mat Cb = ch[2];
 
+
+
+
+    Mat F;
+    {
+        Mat planes0[] = { Y, Mat::zeros(Y.size(), CV_32F) };
+        merge(planes0, 2, F);
+        dft(F, F, DFT_COMPLEX_OUTPUT);
+    }
+
+    //------------------------------------------------------------
+    // Split real/imaginary channels
+    //------------------------------------------------------------
+    Mat planes[2];
+    split(F, planes);
+
+    DeQuantization(planes);
+
+    AnomalySuppression(planes);
+
+    merge(planes, 2, F);
+    // ---------------------------------------------------------
+    // End
+    // ---------------------------------------------------------
+    idft(F, Y, DFT_REAL_OUTPUT | DFT_SCALE);
+
+
+
+
     const int radius = 15;
 
     // 1. M(dx,dy) по Y
