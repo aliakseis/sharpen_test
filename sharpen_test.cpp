@@ -8,7 +8,7 @@ using namespace cv;
 
 Mat computeMaxDiffMatrix(const Mat& gray, int radius)
 {
-    CV_Assert(gray.type() == CV_8U);
+    CV_Assert(gray.type() == CV_32F);
     const int K = 2 * radius + 1;
 
     const int border = 2; // отступ от краёв для безопасного доступа к пикселям
@@ -39,14 +39,14 @@ Mat computeMaxDiffMatrix(const Mat& gray, int radius)
 
             for (int y = yStart; y < yEnd; ++y)
             {
-                const uchar* row1 = gray.ptr<uchar>(y);
-                const uchar* row2 = gray.ptr<uchar>(y + dy);
+                auto row1 = gray.ptr<float>(y);
+                auto row2 = gray.ptr<float>(y + dy);
 
                 for (int x = xStart; x < xEnd; ++x)
                 {
                     //float d = float(row1[x]) - float(row2[x + dx]);
                     //if (d > 0)
-                    float d = std::abs(float(row1[x]) - float(row2[x + dx]));
+                    float d = std::abs(row1[x] - row2[x + dx]);
                     {
                         // добавляем в heap
                         if ((int)heap.size() < nth)
@@ -245,11 +245,12 @@ void shiftPSF(const Mat& src, Mat& dst)
 
 Mat computeCorrelationFFT(const Mat& gray, int radius)
 {
-    CV_Assert(gray.type() == CV_8U);
+    //CV_Assert(gray.type() == CV_8U);
 
     // --- 1. Convert to float and remove DC ---
-    Mat f32;
-    gray.convertTo(f32, CV_32F);
+    //Mat f32;
+    //gray.convertTo(f32, CV_32F);
+    Mat f32 = gray.clone();
     f32 -= mean(f32)[0];   // VERY IMPORTANT
 
 
@@ -543,10 +544,10 @@ void AnomalySuppression(cv::Mat* cpl)
 //---------------------------------------------
 // 5. Применение фильтра к одному каналу
 //---------------------------------------------
-Mat applyFilterDFT(const Mat& gray, const Mat& G)
+Mat applyFilterDFT(const Mat& f32, const Mat& G)
 {
-    Mat f32;
-    gray.convertTo(f32, CV_32F);
+    //Mat f32;
+    //gray.convertTo(f32, CV_32F);
 
     //------------------------------------------------------------
     // Forward complex DFT
@@ -613,7 +614,11 @@ int main(int argc, char** argv)
     cvtColor(img, ycrcb, COLOR_BGR2YCrCb);
     std::vector<Mat> ch;
     split(ycrcb, ch);
-    Mat Y = ch[0];
+    //Mat Y = ch[0];
+
+    Mat Y;
+    ch[0].convertTo(Y, CV_32F);
+
     Mat Cr = ch[1];
     Mat Cb = ch[2];
 
