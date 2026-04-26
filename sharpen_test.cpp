@@ -544,8 +544,10 @@ void AnomalySuppression(cv::Mat* cpl)
 //---------------------------------------------
 // 5. Применение фильтра к одному каналу
 //---------------------------------------------
-Mat applyFilterDFT(const Mat& f32, const Mat& G)
+Mat applyFilterDFT(const Mat& F, const Mat& G)
 {
+    /*
+
     //Mat f32;
     //gray.convertTo(f32, CV_32F);
 
@@ -567,6 +569,7 @@ Mat applyFilterDFT(const Mat& f32, const Mat& G)
 
     DeQuantization(planes);
     merge(planes, 2, F);
+    */
 
     Mat Y;
     mulSpectrums(F, G, Y, 0);
@@ -665,7 +668,7 @@ int main(int argc, char** argv)
         for (int x = 0; x < M.cols; ++x)
         {
             std::cout << std::fixed << std::setprecision(0)
-                << M.at<float>(y, x) << " ";
+                << M.at<float>(y, x) * 4.7f << " ";
         }
         std::cout << "\n";
     }
@@ -695,8 +698,8 @@ int main(int argc, char** argv)
     // 3. Обратный фильтр
     Mat G = buildInverseFilterFromPSF(psf, Y.size(), 0.1f);
 
-    // 4. Деконволюция Y
-    Mat Y_restored = applyFilterDFT(Y, G);
+    // 4. Деконволюция
+    Mat Y_restored = applyFilterDFT(F, G);
 
     // 5. Собираем обратно YCrCb → BGR
     ch[0] = Y_restored;
