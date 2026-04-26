@@ -419,46 +419,14 @@ void DeQuantization(cv::Mat*  planes)
     //merge(planes, 2, Fclean);
 }
 
-//---------------------------------------------
-// 5. Применение фильтра к одному каналу
-//---------------------------------------------
-Mat applyFilterDFT(const Mat& gray, const Mat& G)
+
+
+// ---------------------------------------------------------
+// Near state-of-the-art automatic delicate spectral anomaly suppressor
+// 2D local spectral residual model + anisotropy-safe soft attenuation
+// ---------------------------------------------------------
+void AnomalySuppression(cv::Mat* cpl)
 {
-    Mat f32;
-    gray.convertTo(f32, CV_32F);
-
-    //------------------------------------------------------------
-    // Forward complex DFT
-    //------------------------------------------------------------
-    Mat F;
-    {
-        Mat planes0[] = { f32, Mat::zeros(f32.size(), CV_32F) };
-        merge(planes0, 2, F);
-        dft(F, F, DFT_COMPLEX_OUTPUT);
-    }
-
-    //------------------------------------------------------------
-    // Split real/imaginary channels
-    //------------------------------------------------------------
-    Mat planes[2];
-    split(F, planes);
-
-    DeQuantization(planes);
-    merge(planes, 2, F);
-
-    Mat Y;
-    mulSpectrums(F, G, Y, 0);
-    //*
-    // ---------------------------------------------------------
-    // Near state-of-the-art automatic delicate spectral anomaly suppressor
-    // 2D local spectral residual model + anisotropy-safe soft attenuation
-    // ---------------------------------------------------------
-
-    Mat cpl[2];
-    split(Y, cpl);
-
-    DeQuantization(cpl);
-
     Mat& Re = cpl[0];
     Mat& Im = cpl[1];
 
@@ -494,8 +462,8 @@ Mat applyFilterDFT(const Mat& gray, const Mat& G)
     // ---------------------------------------------------------
     // 4. Build soft anomaly confidence map
     // ---------------------------------------------------------
-    const int rows = Y.rows;
-    const int cols = Y.cols;
+    const int rows = Re.rows;
+    const int cols = Re.cols;
     Mat conf(rows, cols, CV_32F);
 
     for (int y = 0; y < rows; ++y)
@@ -569,6 +537,46 @@ Mat applyFilterDFT(const Mat& gray, const Mat& G)
     // ---------------------------------------------------------
     multiply(Re, mask, Re);
     multiply(Im, mask, Im);
+}
+
+
+//---------------------------------------------
+// 5. Применение фильтра к одному каналу
+//---------------------------------------------
+Mat applyFilterDFT(const Mat& gray, const Mat& G)
+{
+    Mat f32;
+    gray.convertTo(f32, CV_32F);
+
+    //------------------------------------------------------------
+    // Forward complex DFT
+    //------------------------------------------------------------
+    Mat F;
+    {
+        Mat planes0[] = { f32, Mat::zeros(f32.size(), CV_32F) };
+        merge(planes0, 2, F);
+        dft(F, F, DFT_COMPLEX_OUTPUT);
+    }
+
+    //------------------------------------------------------------
+    // Split real/imaginary channels
+    //------------------------------------------------------------
+    Mat planes[2];
+    split(F, planes);
+
+    DeQuantization(planes);
+    merge(planes, 2, F);
+
+    Mat Y;
+    mulSpectrums(F, G, Y, 0);
+    //*
+
+    Mat cpl[2];
+    split(Y, cpl);
+
+    DeQuantization(cpl);
+
+    AnomalySuppression(cpl);
 
     merge(cpl, 2, Y);
 
@@ -583,7 +591,6 @@ Mat applyFilterDFT(const Mat& gray, const Mat& G)
     out32.convertTo(out8, CV_8U);
     return out8;
 }
-
 
 
 
