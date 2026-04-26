@@ -295,19 +295,23 @@ Mat cropPSFToActiveRegionAndFixOdd(const Mat& psf)
 //============================================================
 Mat computeCorrelationFFT(const Mat& gray, int radius)
 {
-    Mat f32 = gray.clone();
+    Mat f32;
+    gray.convertTo(f32, CV_32F);
     f32 -= mean(f32)[0];
 
-    Mat gx, gy, grad;
+    Mat gx, gy;
     Sobel(f32, gx, CV_32F, 1, 0, 3);
     Sobel(f32, gy, CV_32F, 0, 1, 3);
-    magnitude(gx, gy, grad);
-    threshold(grad, f32, 10.0f, 0.0f, THRESH_TOZERO);
+
+    magnitude(gx, gy, f32);
+    threshold(f32, f32, 10.0f, 0.0f, THRESH_TOZERO);
 
     Mat F;
-    Mat planes[] = { f32, Mat::zeros(f32.size(), CV_32F) };
-    merge(planes, 2, F);
-    dft(F, F);
+    {
+        Mat planes[] = { f32, Mat::zeros(f32.size(), CV_32F) };
+        merge(planes, 2, F);
+        dft(F, F, DFT_COMPLEX_OUTPUT);
+    }
 
     Mat Fc;
     mulSpectrums(F, F, Fc, 0, true);
