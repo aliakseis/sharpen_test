@@ -1,391 +1,385 @@
 ﻿#include <opencv2/opencv.hpp>
-
-#include <queue>
 #include <vector>
-#include <functional>
+#include <cmath>
+#include <iostream>
 
 using namespace cv;
 
+//============================================================
+// Helpers
+//============================================================
+static inline void normalizeToUnitSum(Mat& m)
+{
+    Scalar s = sum(m);
+    if (std::abs((float)s[0]) > 1e-12f)
+        m /= (float)s[0];
+}
+
+static inline void safeNormalizeMinMax(Mat& m)
+{
+    double mn, mx;
+    minMaxLoc(m, &mn, &mx);
+    const double d = mx - mn;
+    if (d > 1e-12)
+        m = (m - mn) / d;
+    else
+        m.setTo(0);
+}
+
+//============================================================
+// Cached radial weighting for anomaly suppression
+//============================================================
+static Mat getRadialMidWeight(Size sz)
+{
+    static Size cachedSize;
+    static Mat cached;
+
+    if (cachedSize == sz && !cached.empty())
+        return cached;
+
+    cachedSize = sz;
+    cached.create(sz, CV_32F);
+
+    const int rows = sz.height;
+    const int cols = sz.width;
+
+    const float cx = cols * 0.5f;
+    const float cy = rows * 0.5f;
+    const float Rmax = std::min(cx, cy);
+
+    for (int y = 0; y < rows; ++y)
+    {
+        float* row = cached.ptr<float>(y);
+        const float dy = y - cy;
+
+        for (int x = 0; x < cols; ++x)
+        {
+            const float dx = x - cx;
+            const float r = std::sqrt(dx * dx + dy * dy) / Rmax;
+
+            row[x] = std::exp(
+                -0.5f * (r - 0.42f) * (r - 0.42f) / (0.18f * 0.18f));
+        }
+    }
+
+    return cached;
+}
+
+//============================================================
+// FFT shift
+//============================================================
+static void shiftPSF(const Mat& src, Mat& dst)
+{
+    dst.create(src.size(), src.type());
+
+    const int cx = src.cols / 2;
+    const int cy = src.rows / 2;
+
+    src(Rect(cx, cy, src.cols - cx, src.rows - cy))
+        .copyTo(dst(Rect(0, 0, src.cols - cx, src.rows - cy)));
+
+    src(Rect(0, cy, cx, src.rows - cy))
+        .copyTo(dst(Rect(src.cols - cx, 0, cx, src.rows - cy)));
+
+    src(Rect(cx, 0, src.cols - cx, cy))
+        .copyTo(dst(Rect(0, src.rows - cy, src.cols - cx, cy)));
+
+    src(Rect(0, 0, cx, cy))
+        .copyTo(dst(Rect(src.cols - cx, src.rows - cy, cx, cy)));
+}
+
+//============================================================
+// Top-K accumulator
+//============================================================
+struct TopKMean
+{
+    std::vector<float> heap;
+    int capacity;
+
+    explicit TopKMean(int k = 1) : capacity(k)
+    {
+        heap.reserve(k);
+    }
+
+    inline void siftUp(int i)
+    {
+        while (i > 0)
+        {
+            int p = (i - 1) >> 1;
+            if (heap[p] <= heap[i]) break;
+            std::swap(heap[p], heap[i]);
+            i = p;
+        }
+    }
+
+    inline void siftDown(int i)
+    {
+        const int n = (int)heap.size();
+        for (;;)
+        {
+            int l = i * 2 + 1;
+            int r = l + 1;
+            int m = i;
+
+            if (l < n && heap[l] < heap[m]) m = l;
+            if (r < n && heap[r] < heap[m]) m = r;
+            if (m == i) break;
+
+            std::swap(heap[i], heap[m]);
+            i = m;
+        }
+    }
+
+    inline void insert(float v)
+    {
+        if ((int)heap.size() < capacity)
+        {
+            heap.push_back(v);
+            siftUp((int)heap.size() - 1);
+        }
+        else if (v > heap[0])
+        {
+            heap[0] = v;
+            siftDown(0);
+        }
+    }
+
+    inline float mean() const
+    {
+        if (heap.empty()) return 0.0f;
+        float s = 0.0f;
+        for (float v : heap) s += v;
+        return s / (float)heap.size();
+    }
+};
+
+//============================================================
+// Single-pass industrial computeMaxDiffMatrix
+//============================================================
 Mat computeMaxDiffMatrix(const Mat& gray, int radius)
 {
     CV_Assert(gray.type() == CV_32F);
-    const int K = 2 * radius + 1;
 
-    const int border = 2; // отступ от краёв для безопасного доступа к пикселям
+    const int K = radius * 2 + 1;
+    const int border = 2;
+    const int nth = std::max(1, (gray.rows * gray.cols) / 100);
 
-    //const int num_vals = 30;
+    std::vector<TopKMean> bins;
+    bins.reserve(K * K);
+    for (int i = 0; i < K * K; ++i)
+        bins.emplace_back(nth);
 
-    int nth = (gray.rows * gray.cols) / 100; // примерное значение, можно настроить
+    const int yStart = border + radius;
+    const int yEnd = gray.rows - border - radius;
+    const int xStart = border + radius;
+    const int xEnd = gray.cols - border - radius;
 
-    Mat M(K, K, CV_32F, Scalar(0));
-
-    for (int dy = -radius; dy <= radius; ++dy)
+    for (int y = yStart; y < yEnd; ++y)
     {
-        for (int dx = -radius; dx <= radius; ++dx)
+        std::vector<const float*> nbrRows(K);
+        for (int j = -radius; j <= radius; ++j)
+            nbrRows[j + radius] = gray.ptr<float>(y + j);
+
+        const float* centerRow = gray.ptr<float>(y);
+
+        for (int x = xStart; x < xEnd; ++x)
         {
-            // min-heap для хранения top-n максимумов
-            std::priority_queue<
-                float,
-                std::vector<float>,
-                std::greater<float>
-            > heap;
+            const float c = centerRow[x];
 
-            // --- отступ от краёв ---
-            int yStart = std::max(border, -dy);
-            int yEnd = std::min(gray.rows - border, gray.rows - dy);
-
-            int xStart = std::max(border, -dx);
-            int xEnd = std::min(gray.cols - border, gray.cols - dx);
-
-            for (int y = yStart; y < yEnd; ++y)
+            for (int dy = 0; dy <= radius; ++dy)
             {
-                auto row1 = gray.ptr<float>(y);
-                auto row2 = gray.ptr<float>(y + dy);
+                const float* rowPos = nbrRows[dy + radius];
+                const int dx0 = (dy == 0) ? 1 : -radius;
 
-                for (int x = xStart; x < xEnd; ++x)
+                for (int dx = dx0; dx <= radius; ++dx)
                 {
-                    //float d = float(row1[x]) - float(row2[x + dx]);
-                    //if (d > 0)
-                    float d = std::abs(row1[x] - row2[x + dx]);
-                    {
-                        // добавляем в heap
-                        if ((int)heap.size() < nth)
-                        {
-                            heap.push(d);
-                        }
-                        else if (d > heap.top())
-                        {
-                            heap.pop();
-                            heap.push(d);
-                        }
-                    }
+                    const float d = std::abs(c - rowPos[x + dx]);
+
+                    const int idx1 = (dy + radius) * K + (dx + radius);
+                    const int idx2 = (-dy + radius) * K + (-dx + radius);
+
+                    bins[idx1].insert(d);
+                    bins[idx2].insert(d);
                 }
             }
-
-            //if (heap.size() < nth)
-            //    std::cerr << "Warning: only " << heap.size() << " values for offset (" << dx << "," << dy << ")\n";
-
-            int count = 0;
-            float nthMax = 0.0f;
-            while (!heap.empty())
-            {
-                nthMax += heap.top();
-                heap.pop();
-                count++;
-            }
-            M.at<float>(dy + radius, dx + radius) = (count == 0) ? 0.0f : (nthMax / count);
         }
     }
 
-    //return M;
-    double minVal, maxVal;
-    minMaxLoc(M, &minVal, &maxVal);
+    Mat M(K, K, CV_32F);
+    for (int y = 0; y < K; ++y)
+    {
+        float* row = M.ptr<float>(y);
+        for (int x = 0; x < K; ++x)
+            row[x] = bins[y * K + x].mean();
+    }
 
-    Mat P = (maxVal - M) / (maxVal - minVal); // 0..1
+    double mn, mx;
+    minMaxLoc(M, &mn, &mx);
 
-    Scalar s = sum(P);
-    if (s[0] > 1e-6)
-        P /= s[0];                            // нормировка суммы
+    Mat P;
+    if (mx - mn > 1e-12)
+        P = (mx - M) / (mx - mn);
+    else
+        P = Mat::zeros(M.size(), CV_32F);
 
+    normalizeToUnitSum(P);
     return P;
 }
 
-Mat applyRadialHann(const Mat& P)
-{
-    int h = P.rows, w = P.cols;
-    int cx = w / 2, cy = h / 2;
-    float R = std::min(cx, cy);
-
-    Mat W(P.size(), CV_32F);
-
-    for (int y = 0; y < h; y++)
-    {
-        for (int x = 0; x < w; x++)
-        {
-            float dx = x - cx;
-            float dy = y - cy;
-            float r = std::sqrt(dx * dx + dy * dy);
-
-            float t = std::min(1.0f, r / R);
-            float wv = 0.5f - 0.5f * std::cos(2 * CV_PI * (1 - t));
-            W.at<float>(y, x) = wv;
-        }
-    }
-
-    Mat out;
-    multiply(P, W, out);
-    return out;
-}
-
+//============================================================
 Mat clipPSFByHeap(const Mat& P, float fraction = 0.8f)
 {
-    CV_Assert(P.type() == CV_32F);
+    std::vector<float> vals;
+    vals.reserve(P.total());
 
-    const int total = P.rows * P.cols;
-    const int k = std::max(1, int(total * fraction)); // сколько элементов считаем "краевыми"
-
-    // --- min-heap для поиска k-го минимального ---
-    std::priority_queue<
-        float,
-        std::vector<float>,
-        std::less<float> // max-heap, но мы храним k минимальных
-    > heap;
-
-    for (int y = 0; y < P.rows; y++)
+    for (int y = 0; y < P.rows; ++y)
     {
         const float* row = P.ptr<float>(y);
-        for (int x = 0; x < P.cols; x++)
-        {
-            float v = row[x];
-
-            if ((int)heap.size() < k)
-            {
-                heap.push(v);
-            }
-            else if (v < heap.top())
-            {
-                heap.pop();
-                heap.push(v);
-            }
-        }
+        vals.insert(vals.end(), row, row + P.cols);
     }
 
-    // k-й минимальный элемент — это порог
-    const float threshold = heap.top();
+    const int k = std::max(1, int(vals.size() * fraction));
+    std::nth_element(vals.begin(), vals.begin() + k - 1, vals.end());
+    const float threshold = vals[k - 1];
 
-    // --- Сдвигаем и обнуляем ---
     Mat out = P.clone();
-    for (int y = 0; y < out.rows; y++)
+
+    for (int y = 0; y < out.rows; ++y)
     {
         float* row = out.ptr<float>(y);
-        for (int x = 0; x < out.cols; x++)
-        {
-            float v = row[x] - threshold;
-            row[x] = (v > 0.0f ? v : 0.0f);
-        }
+        for (int x = 0; x < out.cols; ++x)
+            row[x] = std::max(0.0f, row[x] - threshold);
     }
 
     return out;
 }
 
-
+//============================================================
 Mat cropPSFToActiveRegionAndFixOdd(const Mat& psf)
 {
-    CV_Assert(psf.type() == CV_32F);
-
     int top = 0, bottom = psf.rows - 1;
     int left = 0, right = psf.cols - 1;
 
-    // --- верх ---
     while (top <= bottom)
     {
-        bool nonZero = false;
-        const float* row = psf.ptr<float>(top);
-        for (int x = 0; x < psf.cols; x++)
-            if (row[x] != 0.0f) { nonZero = true; break; }
-        if (nonZero) break;
+        bool nz = false;
+        const float* r1 = psf.ptr<float>(top);
+        const float* r2 = psf.ptr<float>(bottom);
 
-        row = psf.ptr<float>(bottom);
-        for (int x = 0; x < psf.cols; x++)
-            if (row[x] != 0.0f) { nonZero = true; break; }
-        if (nonZero) break;
+        for (int x = 0; x < psf.cols; ++x)
+            if (r1[x] != 0.0f || r2[x] != 0.0f) { nz = true; break; }
 
-        top++;
-        bottom--;
+        if (nz) break;
+        ++top; --bottom;
     }
 
-    // --- лево ---
     while (left <= right)
     {
-        bool nonZero = false;
-        for (int y = top; y <= bottom; y++)
-            if (psf.at<float>(y, left) != 0.0f) { nonZero = true; break; }
-        if (nonZero) break;
+        bool nz = false;
+        for (int y = top; y <= bottom; ++y)
+        {
+            const float* row = psf.ptr<float>(y);
+            if (row[left] != 0.0f || row[right] != 0.0f) { nz = true; break; }
+        }
 
-        for (int y = top; y <= bottom; y++)
-            if (psf.at<float>(y, right) != 0.0f) { nonZero = true; break; }
-        if (nonZero) break;
-
-        left++;
-        right--;
+        if (nz) break;
+        ++left; --right;
     }
 
-    // Если всё нули — возвращаем копию
     if (top > bottom || left > right)
         return psf.clone();
 
-    // --- Вырезаем активную область ---
-    Mat cropped = psf(Rect(left, top, right - left + 1, bottom - top + 1)).clone();
-
-    return cropped;
+    return psf(Rect(left, top, right - left + 1, bottom - top + 1)).clone();
 }
 
-
-//---------------------------------------------
-// 3. Сдвиг PSF (центр → (0,0))
-//---------------------------------------------
-void shiftPSF(const Mat& src, Mat& dst)
-{
-    dst.create(src.size(), src.type());
-    int cx = src.cols / 2;
-    int cy = src.rows / 2;
-
-    Mat q0(src, Rect(0, 0, cx, cy));
-    Mat q1(src, Rect(cx, 0, src.cols - cx, cy));
-    Mat q2(src, Rect(0, cy, cx, src.rows - cy));
-    Mat q3(src, Rect(cx, cy, src.cols - cx, src.rows - cy));
-
-    Mat d0(dst, Rect(0, 0, dst.cols - cx, dst.rows - cy));
-    Mat d1(dst, Rect(dst.cols - cx, 0, cx, dst.rows - cy));
-    Mat d2(dst, Rect(0, dst.rows - cy, dst.cols - cx, cy));
-    Mat d3(dst, Rect(dst.cols - cx, dst.rows - cy, cx, cy));
-
-    q3.copyTo(d0);
-    q2.copyTo(d1);
-    q1.copyTo(d2);
-    q0.copyTo(d3);
-}
-
-
+//============================================================
 Mat computeCorrelationFFT(const Mat& gray, int radius)
 {
-    //CV_Assert(gray.type() == CV_8U);
-
-    // --- 1. Convert to float and remove DC ---
-    //Mat f32;
-    //gray.convertTo(f32, CV_32F);
     Mat f32 = gray.clone();
-    f32 -= mean(f32)[0];   // VERY IMPORTANT
+    f32 -= mean(f32)[0];
 
-
-    Mat gx, gy;
+    Mat gx, gy, grad;
     Sobel(f32, gx, CV_32F, 1, 0, 3);
     Sobel(f32, gy, CV_32F, 0, 1, 3);
-
-    Mat grad;
     magnitude(gx, gy, grad);
-
     threshold(grad, f32, 10.0f, 0.0f, THRESH_TOZERO);
 
-    // --- 2. Forward DFT ---
-    Mat planes[] = { f32, Mat::zeros(f32.size(), CV_32F) };
     Mat F;
+    Mat planes[] = { f32, Mat::zeros(f32.size(), CV_32F) };
     merge(planes, 2, F);
     dft(F, F);
 
-    // --- 3. Multiply by conjugate (|F|^2 but in complex form) ---
     Mat Fc;
-    mulSpectrums(F, F, Fc, 0, true);  // conjB = true
+    mulSpectrums(F, F, Fc, 0, true);
 
-    // --- 4. Inverse DFT → correlation ---
     Mat C;
     idft(Fc, C, DFT_REAL_OUTPUT | DFT_SCALE);
 
-    // --- 5. Shift zero-frequency to center ---
     Mat shifted;
     shiftPSF(C, shifted);
 
-    // --- 6. Crop around center ---
-    int cx = shifted.cols / 2;
-    int cy = shifted.rows / 2;
+    const int cx = shifted.cols / 2;
+    const int cy = shifted.rows / 2;
 
-    Mat cropped = shifted(Rect(cx - radius, cy - radius,
-        2 * radius + 1, 2 * radius + 1)).clone();
+    Mat cropped = shifted(Rect(cx - radius, cy - radius, 2 * radius + 1, 2 * radius + 1)).clone();
 
-    //GaussianBlur(cropped, cropped, Size(3, 3), 1.0);
-
-    // --- 7. Normalize for stability ---
-    normalize(cropped, cropped, 0, 1, NORM_MINMAX);
-
-    Scalar s = sum(cropped);
-    if (s[0] > 1e-6)
-        cropped /= s[0];                            // нормировка суммы
+    safeNormalizeMinMax(cropped);
+    normalizeToUnitSum(cropped);
 
     return cropped;
 }
 
-//---------------------------------------------
-// 2. PSF из матрицы M: PSF ≈ max(M) - M, нормировка
-//---------------------------------------------
+//============================================================
 Mat buildPSFFromM(const Mat& M)
 {
-    CV_Assert(M.type() == CV_32F);
-    //double minVal, maxVal;
-    //minMaxLoc(M, &minVal, &maxVal);
-
-    //Mat P = (M - minVal) / (maxVal - minVal); // 0..1
-    //P = 1.0f - P;                             // центр=1, края=0
-
-
     Mat P = clipPSFByHeap(M);
-
     P = cropPSFToActiveRegionAndFixOdd(P);
-
-    //P = applyRadialHann(P);                   // прижимаем края к 0
-
-    //GaussianBlur(P, P, Size(5, 5), 1.0);       // сглаживание
-
-    //pow(P, 2.0, P);                           // gamma correction
-
-    Scalar s = sum(P);
-    if (s[0] > 1e-6)
-        P /= s[0];                            // нормировка суммы
-
+    normalizeToUnitSum(P);
     return P;
 }
 
-//---------------------------------------------
-// 4. Обратный фильтр из PSF
-//---------------------------------------------
+//============================================================
 Mat buildInverseFilterFromPSF(const Mat& psfSmall, Size imgSize, float K = 0.01f)
 {
-    // --- 1. Pad PSF to image size ---
     Mat psfPadded(imgSize, CV_32F, Scalar(0));
-    int x0 = (imgSize.width - psfSmall.cols) / 2;
-    int y0 = (imgSize.height - psfSmall.rows) / 2;
+
+    const int x0 = (imgSize.width - psfSmall.cols) / 2;
+    const int y0 = (imgSize.height - psfSmall.rows) / 2;
+
     psfSmall.copyTo(psfPadded(Rect(x0, y0, psfSmall.cols, psfSmall.rows)));
 
-    // --- 2. Shift PSF so center is at (0,0) ---
     Mat psfShifted;
     shiftPSF(psfPadded, psfShifted);
 
-    // --- 3. Forward DFT of PSF ---
-    Mat planesH[] = { psfShifted.clone(), Mat::zeros(imgSize, CV_32F) };
     Mat H;
+    Mat planesH[] = { psfShifted, Mat::zeros(imgSize, CV_32F) };
     merge(planesH, 2, H);
     dft(H, H, DFT_COMPLEX_OUTPUT);
 
-    // --- 4. Split into real/imag ---
     Mat planes[2];
     split(H, planes);
-    Mat Re = planes[0];
-    Mat Im = planes[1];
 
-    // --- 5. Compute |H|^2 ---
-    Mat mag2;
-    magnitude(Re, Im, mag2);
-    mag2 = mag2.mul(mag2);
+    Mat& Re = planes[0];
+    Mat& Im = planes[1];
 
-    // --- 6. Robust Wiener denominator ---
-    // Adaptive scaling makes K stable across images
-    Scalar meanMag = mean(mag2);
-    float adaptiveK = K * static_cast<float>(meanMag[0] + 1e-8f);
+    Mat mag2 = Re.mul(Re);
+    mag2 += Im.mul(Im);
 
+    const float adaptiveK = K * (float)(mean(mag2)[0] + 1e-8f);
     Mat denom = mag2 + adaptiveK;
 
-    // --- 7. Wiener filter: H* / (|H|^2 + K) ---
-    Mat G_re = Re / denom;
-    Mat G_im = -Im / denom;
+    Re /= denom;
+    Im /= denom;
+    Im = -Im;
 
-    // --- 8. Merge back ---
     Mat G;
-    Mat planesG[] = { G_re, G_im };
-    merge(planesG, 2, G);
-
+    Mat outp[] = { Re, Im };
+    merge(outp, 2, G);
     return G;
 }
 
-void DeQuantization(cv::Mat*  planes)
+//============================================================
+static void DeQuantization(Mat* planes)
 {
     Mat& Re = planes[0];
     Mat& Im = planes[1];
@@ -393,209 +387,101 @@ void DeQuantization(cv::Mat*  planes)
     const float dcRe = Re.at<float>(0, 0);
     const float dcIm = Im.at<float>(0, 0);
 
-    //------------------------------------------------------------
-    // Quantization-only spectral radial shrink
-    //------------------------------------------------------------
+    const float sigma2_axis =
+        (1.0f / 12.0f) * static_cast<float>(Re.total()) * 0.5f;
 
-    // Spatial quantization variance for integer 8-bit rounding
-    const float sigma2_spatial = 1.0f / 12.0f;
+    for (int y = 0; y < Re.rows; ++y)
+    {
+        float* re = Re.ptr<float>(y);
+        float* im = Im.ptr<float>(y);
 
-    // Variance of one Fourier coefficient axis (Re or Im)
-    const float sigma2_axis = sigma2_spatial * static_cast<float>(Re.total()) * 0.5f;
+        for (int x = 0; x < Re.cols; ++x)
+        {
+            const float mag2 = re[x] * re[x] + im[x] * im[x] + 1e-12f;
+            float alpha = 1.0f - sigma2_axis / mag2;
+            if (alpha < 0.0f) alpha = 0.0f;
 
-    // mag2 = Re^2 + Im^2
-    Mat mag2 = Re.mul(Re);
-    mag2 += Im.mul(Im);
+            re[x] *= alpha;
+            im[x] *= alpha;
+        }
+    }
 
-    // alpha = max(1 - sigma2_axis / mag2, 0)
-    Mat alpha;
-    divide(sigma2_axis, mag2 + 1e-12f, alpha);
-    alpha = 1.0f - alpha;
-    max(alpha, 0, alpha);
-
-    // in-place shrink of complex coefficient
-    multiply(Re, alpha, Re);
-    multiply(Im, alpha, Im);
-
-    // preserve DC exactly
     Re.at<float>(0, 0) = dcRe;
     Im.at<float>(0, 0) = dcIm;
-
-    //------------------------------------------------------------
-    // Merge back
-    //------------------------------------------------------------
-    //Mat Fclean;
-    //merge(planes, 2, Fclean);
 }
 
-
-
-// ---------------------------------------------------------
-// Near state-of-the-art automatic delicate spectral anomaly suppressor
-// 2D local spectral residual model + anisotropy-safe soft attenuation
-// ---------------------------------------------------------
-void AnomalySuppression(cv::Mat* cpl)
+//============================================================
+static void AnomalySuppression(Mat* cpl)
 {
     Mat& Re = cpl[0];
     Mat& Im = cpl[1];
 
-    // ---------------------------------------------------------
-    // 1. Magnitude log-spectrum
-    // ---------------------------------------------------------
-    Mat mag;
-    magnitude(Re, Im, mag);
+    Mat work;
+    magnitude(Re, Im, work);
+    work += 1.0f;
+    log(work, work);
 
-    Mat logmag;
-    log(mag + 1.0f, logmag);
-
-    // ---------------------------------------------------------
-    // 2. Broad local spectral baseline
-    // ---------------------------------------------------------
     Mat baseline;
-    GaussianBlur(logmag, baseline, Size(0, 0), 18.0, 18.0, BORDER_REFLECT);
+    GaussianBlur(work, baseline, Size(0, 0), 18.0, 18.0, BORDER_REFLECT);
 
-    // Spectral anomaly residual
-    Mat resid = logmag - baseline;
+    work -= baseline;
 
-    // ---------------------------------------------------------
-    // 3. Global anomaly statistics
-    // ---------------------------------------------------------
     Scalar mu, sd;
-    meanStdDev(resid, mu, sd);
+    meanStdDev(work, mu, sd);
 
-    float mean = (float)mu[0];
-    float stdv = (float)sd[0];
+    const float meanv = (float)mu[0];
+    const float stdv = std::max(0.001f, (float)sd[0]);
 
-    //std::cout << "Residual mean: " << mean << ", stddev: " << stdv << "\n";
-
-    // ---------------------------------------------------------
-    // 4. Build soft anomaly confidence map
-    // ---------------------------------------------------------
-    const int rows = Re.rows;
-    const int cols = Re.cols;
-    Mat conf(rows, cols, CV_32F);
+    const int rows = work.rows;
+    const int cols = work.cols;
 
     for (int y = 0; y < rows; ++y)
     {
-        const float* rp = resid.ptr<float>(y);
-        float* cp = conf.ptr<float>(y);
+        float* wp = work.ptr<float>(y);
 
         for (int x = 0; x < cols; ++x)
         {
-            float z = (rp[x] - mean) / std::max(0.001f, stdv);
-
-            // positive anomalies only
-            if (z < 1.5f)
-            {
-                cp[x] = 0.0f;
-                continue;
-            }
-
-            // smooth confidence growth
-            cp[x] = std::min(1.0f, (z - 1.5f) / 2.5f);
+            const float z = (wp[x] - meanv) / stdv;
+            wp[x] = (z < 1.5f) ? 0.0f : std::min(1.0f, (z - 1.5f) / 2.5f);
         }
     }
 
-    // ---------------------------------------------------------
-    // 5. Remove isolated tiny anomalies (keep broad ripple clouds only)
-    // ---------------------------------------------------------
-    GaussianBlur(conf, conf, Size(0, 0), 3.5, 3.5, BORDER_REFLECT);
+    GaussianBlur(work, work, Size(0, 0), 3.5, 3.5, BORDER_REFLECT);
 
-    // ---------------------------------------------------------
-    // 6. Mid-frequency radial weighting
-    // avoid DC and very high frequencies
-    // ---------------------------------------------------------
-    //const int rows = Y.rows;
-    //const int cols = Y.cols;
-    const float cx = cols * 0.5f;
-    const float cy = rows * 0.5f;
-    const float Rmax = std::min(cx, cy);
-
-    Mat mask(rows, cols, CV_32F);
+    const Mat radial = getRadialMidWeight(work.size());
 
     for (int y = 0; y < rows; ++y)
     {
-        const float* cp = conf.ptr<float>(y);
-        float* mp = mask.ptr<float>(y);
+        float* wp = work.ptr<float>(y);
+        const float* rp = radial.ptr<float>(y);
 
-        float dy = y - cy;
+        for (int x = 0; x < cols; ++x)
+            wp[x] = 1.0f - 0.30f * wp[x] * rp[x];
+    }
+
+    GaussianBlur(work, work, Size(0, 0), 2.0, 2.0, BORDER_REFLECT);
+
+    for (int y = 0; y < rows; ++y)
+    {
+        const float* mp = work.ptr<float>(y);
+        float* re = Re.ptr<float>(y);
+        float* im = Im.ptr<float>(y);
 
         for (int x = 0; x < cols; ++x)
         {
-            float dx = x - cx;
-            float r = std::sqrt(dx * dx + dy * dy) / Rmax;
-
-            // radial emphasis on middle frequencies only
-            float mid =
-                std::exp(-0.5f * (r - 0.42f) * (r - 0.42f) / (0.18f * 0.18f));
-
-            // attenuation strength limited and delicate
-            float atten = 0.30f * cp[x] * mid;
-
-            mp[x] = 1.0f - atten;
+            const float m = mp[x];
+            re[x] *= m;
+            im[x] *= m;
         }
     }
-
-    // ---------------------------------------------------------
-    // 7. Optional final smoothing of mask to avoid hard spectral transitions
-    // ---------------------------------------------------------
-    GaussianBlur(mask, mask, Size(0, 0), 2.0, 2.0, BORDER_REFLECT);
-
-    // ---------------------------------------------------------
-    // 8. Apply
-    // ---------------------------------------------------------
-    multiply(Re, mask, Re);
-    multiply(Im, mask, Im);
 }
 
-
-//---------------------------------------------
-// 5. Применение фильтра к одному каналу
-//---------------------------------------------
+//============================================================
 Mat applyFilterDFT(const Mat& F, const Mat& G)
 {
-    /*
-
-    //Mat f32;
-    //gray.convertTo(f32, CV_32F);
-
-    //------------------------------------------------------------
-    // Forward complex DFT
-    //------------------------------------------------------------
-    Mat F;
-    {
-        Mat planes0[] = { f32, Mat::zeros(f32.size(), CV_32F) };
-        merge(planes0, 2, F);
-        dft(F, F, DFT_COMPLEX_OUTPUT);
-    }
-
-    //------------------------------------------------------------
-    // Split real/imaginary channels
-    //------------------------------------------------------------
-    Mat planes[2];
-    split(F, planes);
-
-    DeQuantization(planes);
-    merge(planes, 2, F);
-    */
-
     Mat Y;
     mulSpectrums(F, G, Y, 0);
-    //*
 
-    Mat cpl[2];
-    split(Y, cpl);
-
-    DeQuantization(cpl);
-
-    AnomalySuppression(cpl);
-
-    merge(cpl, 2, Y);
-
-    // ---------------------------------------------------------
-    // End
-    // ---------------------------------------------------------
-    //*/
     Mat out32;
     idft(Y, out32, DFT_REAL_OUTPUT | DFT_SCALE);
 
@@ -604,11 +490,36 @@ Mat applyFilterDFT(const Mat& F, const Mat& G)
     return out8;
 }
 
+//============================================================
+Mat deblurChannel(const Mat& gray)
+{
+    Mat Y;
+    gray.convertTo(Y, CV_32F);
 
+    const int radius = 15;
 
-//---------------------------------------------
-// 6. Основной пример: работаем по Y, возвращаем цвет
-//---------------------------------------------
+    Mat M = computeMaxDiffMatrix(Y, radius) + computeCorrelationFFT(Y, radius);
+    Mat psf = buildPSFFromM(M);
+    Mat G = buildInverseFilterFromPSF(psf, Y.size(), 0.1f);
+
+    Mat F;
+    {
+        Mat planes0[] = { Y, Mat::zeros(Y.size(), CV_32F) };
+        merge(planes0, 2, F);
+        dft(F, F, DFT_COMPLEX_OUTPUT);
+    }
+
+    Mat planes[2];
+    split(F, planes);
+
+    DeQuantization(planes);
+    AnomalySuppression(planes);
+
+    merge(planes, 2, F);
+
+    return applyFilterDFT(F, G);
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 3)
@@ -627,90 +538,12 @@ int main(int argc, char** argv)
     split(ycrcb, ch);
     //Mat Y = ch[0];
 
-    Mat Y;
-    ch[0].convertTo(Y, CV_32F);
 
     Mat Cr = ch[1];
     Mat Cb = ch[2];
 
+    ch[0] = deblurChannel(ch[0]);
 
-
-
-    Mat F;
-    {
-        Mat planes0[] = { Y, Mat::zeros(Y.size(), CV_32F) };
-        merge(planes0, 2, F);
-        dft(F, F, DFT_COMPLEX_OUTPUT);
-    }
-
-    //------------------------------------------------------------
-    // Split real/imaginary channels
-    //------------------------------------------------------------
-    Mat planes[2];
-    split(F, planes);
-
-    DeQuantization(planes);
-
-    AnomalySuppression(planes);
-
-    merge(planes, 2, F);
-    // ---------------------------------------------------------
-    // End
-    // ---------------------------------------------------------
-    idft(F, Y, DFT_REAL_OUTPUT | DFT_SCALE);
-
-
-
-
-    const int radius = 15;
-
-    // 1. M(dx,dy) по Y
-    //Mat M = computeMaxDiffMatrix(Y, radius);
-    //Mat M = computeCorrelationFFT(Y, radius);
-
-    Mat M = computeMaxDiffMatrix(Y, radius) + computeCorrelationFFT(Y, radius);
-
-    std::cout << "M:\n";
-    for (int y = 0; y < M.rows; ++y)
-    {
-        for (int x = 0; x < M.cols; ++x)
-        {
-            std::cout << std::fixed << std::setprecision(0)
-                << M.at<float>(y, x) * 4.7f << " ";
-        }
-        std::cout << "\n";
-    }
-    std::cout << std::endl;
-
-
-    // 2. PSF из M
-    Mat psf = buildPSFFromM(M);
-
-    std::cout << "PSF dim: " << psf.size() << "\n";
-
-    // --- Вывод PSF в консоль ---
-    //*
-    std::cout << "PSF:\n";
-    for (int y = 0; y < psf.rows; ++y)
-    {
-        for (int x = 0; x < psf.cols; ++x)
-        {
-            std::cout << std::fixed << std::setprecision(4)
-                << psf.at<float>(y, x) << " ";
-        }
-        std::cout << "\n";
-    }
-    std::cout << std::endl;
-    //*/
-
-    // 3. Обратный фильтр
-    Mat G = buildInverseFilterFromPSF(psf, Y.size(), 0.1f);
-
-    // 4. Деконволюция
-    Mat Y_restored = applyFilterDFT(F, G);
-
-    // 5. Собираем обратно YCrCb → BGR
-    ch[0] = Y_restored;
     merge(ch, ycrcb);
 
     Mat restoredBGR;
@@ -718,7 +551,7 @@ int main(int argc, char** argv)
 
     imwrite(argv[2], restoredBGR);
     if (argc > 3)
-        imwrite(argv[3], Y_restored);
+        imwrite(argv[3], ch[0]);
 
     return 0;
 }
