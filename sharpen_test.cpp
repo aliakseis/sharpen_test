@@ -93,7 +93,8 @@ typedef std::array<uint32_t, 256> TopKMean;
 //============================================================
 // Single-pass industrial computeMaxDiffMatrix
 //============================================================
-Mat computeMaxDiffMatrix(const Mat& gray, int radius)
+template<int radius>
+Mat doComputeMaxDiffMatrix(const Mat& gray)
 {
     CV_Assert(gray.type() == CV_8U);
 
@@ -101,7 +102,7 @@ Mat computeMaxDiffMatrix(const Mat& gray, int radius)
     const int border = 2;
     const int nth = std::max(1, (gray.rows * gray.cols) / 100);
 
-    std::vector<TopKMean> bins(K * K);
+    std::array<TopKMean, K* K> bins{};
     //bins.reserve(K * K);
     //for (int i = 0; i < K * K; ++i)
     //    bins.emplace_back(nth);
@@ -111,9 +112,11 @@ Mat computeMaxDiffMatrix(const Mat& gray, int radius)
     const int xStart = border + radius;
     const int xEnd = gray.cols - border - radius;
 
+    std::array<const uchar*, K> nbrRows{};
+
     for (int y = yStart; y < yEnd; ++y)
     {
-        std::vector<const uchar*> nbrRows(K);
+        //std::vector<const uchar*> nbrRows(K);
         for (int j = -radius; j <= radius; ++j)
             nbrRows[j + radius] = gray.ptr<uchar>(y + j);
 
@@ -180,6 +183,33 @@ Mat computeMaxDiffMatrix(const Mat& gray, int radius)
     normalizeToUnitSum(P);
     return P;
 }
+
+Mat computeMaxDiffMatrix(const Mat& gray, int radius)
+{
+    switch (radius)
+    {
+    case 1: return doComputeMaxDiffMatrix<1>(gray);
+    case 2: return doComputeMaxDiffMatrix<2>(gray);
+    case 3: return doComputeMaxDiffMatrix<3>(gray);
+    case 4: return doComputeMaxDiffMatrix<4>(gray);
+    case 5: return doComputeMaxDiffMatrix<5>(gray);
+    case 6: return doComputeMaxDiffMatrix<6>(gray);
+    case 7: return doComputeMaxDiffMatrix<7>(gray);
+    case 8: return doComputeMaxDiffMatrix<8>(gray);
+    case 9: return doComputeMaxDiffMatrix<9>(gray);
+    case 10: return doComputeMaxDiffMatrix<10>(gray);
+    case 11: return doComputeMaxDiffMatrix<11>(gray);
+    case 12: return doComputeMaxDiffMatrix<12>(gray);
+    case 13: return doComputeMaxDiffMatrix<13>(gray);
+    case 14: return doComputeMaxDiffMatrix<14>(gray);
+    case 15: return doComputeMaxDiffMatrix<15>(gray);
+    default:
+        CV_Error(Error::StsBadArg, "Unsupported radius");
+        return Mat();
+    }
+}
+
+
 
 //============================================================
 Mat clipPSFByHeap(const Mat& P, float fraction = 0.8f)
