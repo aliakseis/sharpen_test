@@ -100,25 +100,22 @@ Mat doComputeMaxDiffMatrix(const Mat& gray)
 
     const int K = radius * 2 + 1;
     const int border = 2;
-    const int nth = std::max(1, (gray.rows * gray.cols) / 100);
 
-    std::array<TopKMean, K* K> bins{};
-    //bins.reserve(K * K);
-    //for (int i = 0; i < K * K; ++i)
-    //    bins.emplace_back(nth);
+    const auto binsSize = (K - 1) * (radius + 1);
+    static_assert(binsSize * 2 + 1 == K * K);
+    std::array<TopKMean, binsSize> bins{};
 
-    const int yStart = border + radius;
+    const int yStart = border;// +radius;
     const int yEnd = gray.rows - border - radius;
     const int xStart = border + radius;
     const int xEnd = gray.cols - border - radius;
 
-    std::array<const uchar*, K> nbrRows{};
+    std::array<const uchar*, radius + 1> nbrRows{};
 
     for (int y = yStart; y < yEnd; ++y)
     {
-        //std::vector<const uchar*> nbrRows(K);
-        for (int j = -radius; j <= radius; ++j)
-            nbrRows[j + radius] = gray.ptr<uchar>(y + j);
+        for (int j = 0; j <= radius; ++j)
+            nbrRows[j] = gray.ptr<uchar>(y + j);
 
         const uchar* centerRow = gray.ptr<uchar>(y);
 
@@ -126,50 +123,68 @@ Mat doComputeMaxDiffMatrix(const Mat& gray)
         {
             const uchar c = centerRow[x];
 
+            int cache[256];
+
+            for (int i = 0; i < 256; ++i)
+                cache[i] = std::abs(c - i);
+
+            int dx = 1;
+            int idx1 = 0;
+
             for (int dy = 0; dy <= radius; ++dy)
             {
-                const uchar* rowPos = nbrRows[dy + radius];
-                const int dx0 = (dy == 0) ? 1 : -radius;
+                const uchar* rowPos = nbrRows[dy];
 
-                for (int dx = dx0; dx <= radius; ++dx)
+                for (; dx <= radius; ++dx, ++idx1)
                 {
-                    const int d = std::abs(c - rowPos[x + dx]);
-
-                    const int idx1 = (dy + radius) * K + (dx + radius);
-                    const int idx2 = (-dy + radius) * K + (-dx + radius);
+                    const int d = cache[rowPos[x + dx]];
 
                     ++bins[idx1][d];
-                    ++bins[idx2][d];
                 }
+
+                dx = -radius;
             }
+
+            if (idx1 != binsSize)
+                CV_Error(Error::StsInternal, "Index mismatch in bins");
         }
     }
 
-    Mat M(K, K, CV_32F);
-    for (int y = 0; y < K; ++y)
+    std::vector<float> values;
+
+    const int nth = std::max(1, (gray.rows * gray.cols) / 100);
+
+    for (auto& bin : bins)
     {
-        float* row = M.ptr<float>(y);
-        for (int x = 0; x < K; ++x)
+        float sum = 0.0f;
+        int count = 0;
+        for (int i = 255; i >= 0; --i)
         {
-            const auto& bin = bins[y * K + x];
-            float sum = 0.0f;
-            int count = 0;
-            for (int i = 255; i >= 0; --i)
+            if (count + bin[i] >= nth)
             {
-                if (count + bin[i] >= nth)
-                {
-                    count = nth;
-                    sum += (nth - count) * i;
-                    break;
-                }
-                else {
-                    count += bin[i];
-                    sum += bin[i] * i;
-                }
+                count = nth;
+                sum += (nth - count) * i;
+                break;
             }
-            row[x] = (count > 0) ? (sum / count) : 0.0f;
+            else {
+                count += bin[i];
+                sum += bin[i] * i;
+            }
         }
+        const float value = (count > 0) ? (sum / count) : 0.0f;
+        values.push_back(value);
     }
+
+    std::vector<float> allValues(values.rbegin(), values.rend());
+    allValues.push_back(0.0f);
+    allValues.insert(allValues.end(), values.begin(), values.end());
+
+    if (allValues.size() != K * K)
+        CV_Error(Error::StsInternal, "Total values count mismatch");
+
+    cv::Mat M(K, K, CV_32F, allValues.data());
+
+    //std::cout << "M:\n" << M << "\n";
 
     double mn, mx;
     minMaxLoc(M, &mn, &mx);
