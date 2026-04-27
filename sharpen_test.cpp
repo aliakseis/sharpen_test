@@ -94,11 +94,11 @@ static void shiftPSF(const Mat& src, Mat& dst)
 struct TopKMean
 {
     std::vector<float> heap;
-    int capacity;
+    int size = 0;
 
-    explicit TopKMean(int k = 1) : capacity(k)
+    explicit TopKMean(int k = 1)
     {
-        heap.reserve(k);
+        heap.resize(k);
     }
 
     inline void siftUp(int i)
@@ -114,7 +114,7 @@ struct TopKMean
 
     inline void siftDown(int i)
     {
-        const int n = (int)heap.size();
+        const int n = size;
         for (;;)
         {
             int l = i * 2 + 1;
@@ -132,10 +132,11 @@ struct TopKMean
 
     inline void insert(float v)
     {
-        if ((int)heap.size() < capacity)
+        if (size < (int)heap.size())
         {
-            heap.push_back(v);
-            siftUp((int)heap.size() - 1);
+            heap[size] = v;
+            siftUp(size);
+            ++size;
         }
         else if (v > heap[0])
         {
@@ -146,10 +147,10 @@ struct TopKMean
 
     inline float mean() const
     {
-        if (heap.empty()) return 0.0f;
+        if (size == 0) return 0.0f;
         float s = 0.0f;
-        for (float v : heap) s += v;
-        return s / (float)heap.size();
+        for (int i = 0; i < size; ++i) s += heap[i];
+        return s / (float)size;
     }
 };
 
@@ -162,7 +163,7 @@ Mat computeMaxDiffMatrix(const Mat& gray, int radius)
 
     const int K = radius * 2 + 1;
     const int border = 2;
-    const int nth = std::max(1, (gray.rows * gray.cols) / 100);
+    const int nth = 100; // std::max(1, (gray.rows * gray.cols) / 100);
 
     std::vector<TopKMean> bins;
     bins.reserve(K * K);
@@ -540,13 +541,15 @@ int main(int argc, char** argv)
     cvtColor(img, ycrcb, COLOR_BGR2YCrCb);
     std::vector<Mat> ch;
     split(ycrcb, ch);
-    //Mat Y = ch[0];
-
 
     Mat Cr = ch[1];
     Mat Cb = ch[2];
 
+    auto start = std::chrono::high_resolution_clock::now();
     ch[0] = deblurChannel(ch[0]);
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    std::cout << "Processing time: " << elapsed.count() << " seconds\n";
 
     merge(ch, ycrcb);
 
