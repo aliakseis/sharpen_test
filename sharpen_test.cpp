@@ -88,87 +88,23 @@ static void shiftPSF(const Mat& src, Mat& dst)
         .copyTo(dst(Rect(src.cols - cx, src.rows - cy, cx, cy)));
 }
 
-//============================================================
-// Top-K accumulator
-//============================================================
-struct TopKMean
-{
-    std::vector<float> heap;
-    int size = 0;
-
-    explicit TopKMean(int k = 1)
-    {
-        heap.resize(k);
-    }
-
-    inline void siftUp(int i)
-    {
-        while (i > 0)
-        {
-            int p = (i - 1) >> 1;
-            if (heap[p] <= heap[i]) break;
-            std::swap(heap[p], heap[i]);
-            i = p;
-        }
-    }
-
-    inline void siftDown(int i)
-    {
-        const int n = size;
-        for (;;)
-        {
-            int l = i * 2 + 1;
-            int r = l + 1;
-            int m = i;
-
-            if (l < n && heap[l] < heap[m]) m = l;
-            if (r < n && heap[r] < heap[m]) m = r;
-            if (m == i) break;
-
-            std::swap(heap[i], heap[m]);
-            i = m;
-        }
-    }
-
-    inline void insert(float v)
-    {
-        if (size < (int)heap.size())
-        {
-            heap[size] = v;
-            siftUp(size);
-            ++size;
-        }
-        else if (v > heap[0])
-        {
-            heap[0] = v;
-            siftDown(0);
-        }
-    }
-
-    inline float mean() const
-    {
-        if (size == 0) return 0.0f;
-        float s = 0.0f;
-        for (int i = 0; i < size; ++i) s += heap[i];
-        return s / (float)size;
-    }
-};
+typedef std::array<uint32_t, 256> TopKMean;
 
 //============================================================
 // Single-pass industrial computeMaxDiffMatrix
 //============================================================
 Mat computeMaxDiffMatrix(const Mat& gray, int radius)
 {
-    CV_Assert(gray.type() == CV_32F);
+    CV_Assert(gray.type() == CV_8U);
 
     const int K = radius * 2 + 1;
     const int border = 2;
-    const int nth = 100; // std::max(1, (gray.rows * gray.cols) / 100);
+    const int nth = std::max(1, (gray.rows * gray.cols) / 100);
 
-    std::vector<TopKMean> bins;
-    bins.reserve(K * K);
-    for (int i = 0; i < K * K; ++i)
-        bins.emplace_back(nth);
+    std::vector<TopKMean> bins(K * K);
+    //bins.reserve(K * K);
+    //for (int i = 0; i < K * K; ++i)
+    //    bins.emplace_back(nth);
 
     const int yStart = border + radius;
     const int yEnd = gray.rows - border - radius;
@@ -177,30 +113,30 @@ Mat computeMaxDiffMatrix(const Mat& gray, int radius)
 
     for (int y = yStart; y < yEnd; ++y)
     {
-        std::vector<const float*> nbrRows(K);
+        std::vector<const uchar*> nbrRows(K);
         for (int j = -radius; j <= radius; ++j)
-            nbrRows[j + radius] = gray.ptr<float>(y + j);
+            nbrRows[j + radius] = gray.ptr<uchar>(y + j);
 
-        const float* centerRow = gray.ptr<float>(y);
+        const uchar* centerRow = gray.ptr<uchar>(y);
 
         for (int x = xStart; x < xEnd; ++x)
         {
-            const float c = centerRow[x];
+            const uchar c = centerRow[x];
 
             for (int dy = 0; dy <= radius; ++dy)
             {
-                const float* rowPos = nbrRows[dy + radius];
+                const uchar* rowPos = nbrRows[dy + radius];
                 const int dx0 = (dy == 0) ? 1 : -radius;
 
                 for (int dx = dx0; dx <= radius; ++dx)
                 {
-                    const float d = std::abs(c - rowPos[x + dx]);
+                    const int d = std::abs(c - rowPos[x + dx]);
 
                     const int idx1 = (dy + radius) * K + (dx + radius);
                     const int idx2 = (-dy + radius) * K + (-dx + radius);
 
-                    bins[idx1].insert(d);
-                    bins[idx2].insert(d);
+                    ++bins[idx1][d];
+                    ++bins[idx2][d];
                 }
             }
         }
@@ -211,7 +147,25 @@ Mat computeMaxDiffMatrix(const Mat& gray, int radius)
     {
         float* row = M.ptr<float>(y);
         for (int x = 0; x < K; ++x)
-            row[x] = bins[y * K + x].mean();
+        {
+            const auto& bin = bins[y * K + x];
+            float sum = 0.0f;
+            int count = 0;
+            for (int i = 255; i >= 0; --i)
+            {
+                if (count + bin[i] >= nth)
+                {
+                    count = nth;
+                    sum += (nth - count) * i;
+                    break;
+                }
+                else {
+                    count += bin[i];
+                    sum += bin[i] * i;
+                }
+            }
+            row[x] = (count > 0) ? (sum / count) : 0.0f;
+        }
     }
 
     double mn, mx;
@@ -503,7 +457,7 @@ Mat deblurChannel(const Mat& gray)
 
     const int radius = 15;
 
-    Mat M = computeMaxDiffMatrix(Y, radius) + computeCorrelationFFT(Y, radius);
+    Mat M = computeMaxDiffMatrix(gray, radius) + computeCorrelationFFT(Y, radius);
     Mat psf = buildPSFFromM(M);
     Mat G = buildInverseFilterFromPSF(psf, Y.size(), 0.1f);
 
