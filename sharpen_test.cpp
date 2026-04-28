@@ -88,7 +88,7 @@ static void shiftPSF(const Mat& src, Mat& dst)
         .copyTo(dst(Rect(src.cols - cx, src.rows - cy, cx, cy)));
 }
 
-typedef std::array<uint32_t, 256> TopKMean;
+//typedef std::array<uint32_t, 256> TopKMean;
 
 //============================================================
 // Single-pass industrial computeMaxDiffMatrix
@@ -101,78 +101,93 @@ Mat doComputeMaxDiffMatrix(const Mat& gray)
     const int K = radius * 2 + 1;
     const int border = 2;
 
-    const auto binsSize = (K - 1) * (radius + 1);
+    const int binsSize = (K - 1) * (radius + 1);
     static_assert(binsSize * 2 + 1 == K * K);
-    std::array<TopKMean, binsSize> bins{};
 
-    const int yStart = border;// +radius;
+    const int yStart = border;
     const int yEnd = gray.rows - border - radius;
     const int xStart = border + radius;
     const int xEnd = gray.cols - border - radius;
 
-    std::array<const uchar*, radius + 1> nbrRows{};
+    const int binsLen = binsSize * 256;
 
-    for (int y = yStart; y < yEnd; ++y)
+    // Глобальный bins (результат после редукции)
+    std::vector<uint32_t> bins(binsLen, 0);
+
+    // Параллельный проход по y
+#pragma omp parallel
     {
-        for (int j = 0; j <= radius; ++j)
-            nbrRows[j] = gray.ptr<uchar>(y + j);
+        std::array<const uchar*, radius + 1> nbrRows{};
+        std::vector<uint32_t> localBins(binsLen, 0);
 
-        const uchar* centerRow = gray.ptr<uchar>(y);
-
-        for (int x = xStart; x < xEnd; ++x)
+#pragma omp for nowait
+        for (int y = yStart; y < yEnd; ++y)
         {
-            const uchar c = centerRow[x];
+            for (int j = 0; j <= radius; ++j)
+                nbrRows[j] = gray.ptr<uchar>(y + j);
 
-            int cache[256];
+            const uchar* centerRow = gray.ptr<uchar>(y);
 
-            for (int i = 0; i < 256; ++i)
-                cache[i] = std::abs(c - i);
-
-            int dx = 1;
-            int idx1 = 0;
-
-            for (int dy = 0; dy <= radius; ++dy)
+            for (int x = xStart; x < xEnd; ++x)
             {
-                const uchar* rowPos = nbrRows[dy];
+                const uchar c = centerRow[x];
 
-                for (; dx <= radius; ++dx, ++idx1)
+                int dx = 1;
+                uint32_t* idx1 = localBins.data();
+
+                for (int dy = 0; dy <= radius; ++dy)
                 {
-                    const int d = cache[rowPos[x + dx]];
+                    const uchar* rowPos = nbrRows[dy];
 
-                    ++bins[idx1][d];
+                    for (; dx <= radius; ++dx, idx1 += 256)
+                    {
+                        const int d = std::abs(c - rowPos[x + dx]);
+                        ++idx1[d];
+                    }
+
+                    dx = -radius;
                 }
 
-                dx = -radius;
+#ifndef NDEBUG
+                if (idx1 - localBins.data() != binsLen)
+                    CV_Error(Error::StsInternal, "Index mismatch in bins");
+#endif
             }
+        }
 
-            if (idx1 != binsSize)
-                CV_Error(Error::StsInternal, "Index mismatch in bins");
+        // Редукция локальных bins в глобальный
+#pragma omp critical
+        {
+            for (int i = 0; i < binsLen; ++i)
+                bins[i] += localBins[i];
         }
     }
 
     std::vector<float> values;
+    values.reserve(binsSize);
 
     const int nth = std::max(1, (gray.rows * gray.cols) / 100);
 
-    for (auto& bin : bins)
+    for (int j = 0; j < binsSize; ++j)
     {
+        uint32_t* bin = bins.data() + j * 256;
         float sum = 0.0f;
         int count = 0;
+
         for (int i = 255; i >= 0; --i)
         {
-            if (count + bin[i] >= nth)
+            const uint32_t v = bin[i];
+            if (count + v >= nth)
             {
-                count = nth;
                 sum += (nth - count) * i;
+                count = nth;
                 break;
             }
-            else {
-                count += bin[i];
-                sum += bin[i] * i;
-            }
+            sum += v * i;
+            count += v;
         }
-        const float value = (count > 0) ? (sum / count) : 0.0f;
-        values.push_back(value);
+
+        values.push_back(count > 0 ? sum / count : 0.0f);
     }
 
     std::vector<float> allValues(values.rbegin(), values.rend());
@@ -182,9 +197,7 @@ Mat doComputeMaxDiffMatrix(const Mat& gray)
     if (allValues.size() != K * K)
         CV_Error(Error::StsInternal, "Total values count mismatch");
 
-    cv::Mat M(K, K, CV_32F, allValues.data());
-
-    //std::cout << "M:\n" << M << "\n";
+    Mat M(K, K, CV_32F, allValues.data());
 
     double mn, mx;
     minMaxLoc(M, &mn, &mx);
