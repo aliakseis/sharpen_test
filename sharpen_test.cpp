@@ -5,6 +5,1262 @@
 
 using namespace cv;
 
+
+// ============================================================================
+// OpenCL implementation of computeMaxDiffMatrix
+//
+// OpenCL version compatibility:
+//   - Designed to compile with OpenCL 1.2 headers.
+//   - Uses clCreateCommandQueueWithProperties dynamically when the runtime
+//     provides it.
+//   - Falls back to clCreateCommandQueue for older implementations.
+//
+// The GPU performs the expensive histogram accumulation.
+// Histogram reduction and the final M/P construction remain on the CPU,
+// preserving the semantics of the existing implementation.
+//
+// ============================================================================
+
+#define CL_USE_DEPRECATED_OPENCL_1_2_APIS
+#include <CL/cl.h>
+
+//#include <opencv2/opencv.hpp>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace MaxDiffOpenCL
+{
+
+    using namespace cv;
+
+    // -----------------------------------------------------------------------------
+    // OpenCL error helper
+    // -----------------------------------------------------------------------------
+
+    static const char* clErrorString(cl_int err)
+    {
+        switch (err)
+        {
+        case CL_SUCCESS:                                   return "CL_SUCCESS";
+        case CL_DEVICE_NOT_FOUND:                          return "CL_DEVICE_NOT_FOUND";
+        case CL_DEVICE_NOT_AVAILABLE:                      return "CL_DEVICE_NOT_AVAILABLE";
+        case CL_COMPILER_NOT_AVAILABLE:                    return "CL_COMPILER_NOT_AVAILABLE";
+        case CL_MEM_OBJECT_ALLOCATION_FAILURE:             return "CL_MEM_OBJECT_ALLOCATION_FAILURE";
+        case CL_OUT_OF_RESOURCES:                           return "CL_OUT_OF_RESOURCES";
+        case CL_OUT_OF_HOST_MEMORY:                         return "CL_OUT_OF_HOST_MEMORY";
+        case CL_PROFILING_INFO_NOT_AVAILABLE:              return "CL_PROFILING_INFO_NOT_AVAILABLE";
+        case CL_MEM_COPY_OVERLAP:                           return "CL_MEM_COPY_OVERLAP";
+        case CL_IMAGE_FORMAT_MISMATCH:                     return "CL_IMAGE_FORMAT_MISMATCH";
+        case CL_IMAGE_FORMAT_NOT_SUPPORTED:                return "CL_IMAGE_FORMAT_NOT_SUPPORTED";
+        case CL_BUILD_PROGRAM_FAILURE:                     return "CL_BUILD_PROGRAM_FAILURE";
+        case CL_MAP_FAILURE:                               return "CL_MAP_FAILURE";
+        case CL_INVALID_VALUE:                             return "CL_INVALID_VALUE";
+        case CL_INVALID_DEVICE_TYPE:                       return "CL_INVALID_DEVICE_TYPE";
+        case CL_INVALID_PLATFORM:                          return "CL_INVALID_PLATFORM";
+        case CL_INVALID_DEVICE:                            return "CL_INVALID_DEVICE";
+        case CL_INVALID_CONTEXT:                           return "CL_INVALID_CONTEXT";
+        case CL_INVALID_QUEUE_PROPERTIES:                  return "CL_INVALID_QUEUE_PROPERTIES";
+        case CL_INVALID_COMMAND_QUEUE:                     return "CL_INVALID_COMMAND_QUEUE";
+        case CL_INVALID_HOST_PTR:                          return "CL_INVALID_HOST_PTR";
+        case CL_INVALID_MEM_OBJECT:                        return "CL_INVALID_MEM_OBJECT";
+        case CL_INVALID_IMAGE_FORMAT_DESCRIPTOR:           return "CL_INVALID_IMAGE_FORMAT_DESCRIPTOR";
+        case CL_INVALID_IMAGE_SIZE:                         return "CL_INVALID_IMAGE_SIZE";
+        case CL_INVALID_SAMPLER:                           return "CL_INVALID_SAMPLER";
+        case CL_INVALID_BINARY:                            return "CL_INVALID_BINARY";
+        case CL_INVALID_BUILD_OPTIONS:                     return "CL_INVALID_BUILD_OPTIONS";
+        case CL_INVALID_PROGRAM:                           return "CL_INVALID_PROGRAM";
+        case CL_INVALID_PROGRAM_EXECUTABLE:                return "CL_INVALID_PROGRAM_EXECUTABLE";
+        case CL_INVALID_KERNEL_NAME:                       return "CL_INVALID_KERNEL_NAME";
+        case CL_INVALID_KERNEL_DEFINITION:                 return "CL_INVALID_KERNEL_DEFINITION";
+        case CL_INVALID_KERNEL:                            return "CL_INVALID_KERNEL";
+        case CL_INVALID_ARG_INDEX:                          return "CL_INVALID_ARG_INDEX";
+        case CL_INVALID_ARG_VALUE:                          return "CL_INVALID_ARG_VALUE";
+        case CL_INVALID_ARG_SIZE:                           return "CL_INVALID_ARG_SIZE";
+        case CL_INVALID_KERNEL_ARGS:                        return "CL_INVALID_KERNEL_ARGS";
+        case CL_INVALID_WORK_DIMENSION:                     return "CL_INVALID_WORK_DIMENSION";
+        case CL_INVALID_WORK_GROUP_SIZE:                    return "CL_INVALID_WORK_GROUP_SIZE";
+        case CL_INVALID_WORK_ITEM_SIZE:                     return "CL_INVALID_WORK_ITEM_SIZE";
+        case CL_INVALID_GLOBAL_OFFSET:                      return "CL_INVALID_GLOBAL_OFFSET";
+        case CL_INVALID_EVENT_WAIT_LIST:                    return "CL_INVALID_EVENT_WAIT_LIST";
+        case CL_INVALID_EVENT:                              return "CL_INVALID_EVENT";
+        case CL_INVALID_OPERATION:                          return "CL_INVALID_OPERATION";
+        case CL_INVALID_GL_OBJECT:                          return "CL_INVALID_GL_OBJECT";
+        case CL_INVALID_BUFFER_SIZE:                        return "CL_INVALID_BUFFER_SIZE";
+        case CL_INVALID_MIP_LEVEL:                          return "CL_INVALID_MIP_LEVEL";
+        case CL_INVALID_GLOBAL_WORK_SIZE:                   return "CL_INVALID_GLOBAL_WORK_SIZE";
+        default:                                            return "CL_UNKNOWN_ERROR";
+        }
+    }
+
+    static void checkCL(cl_int err, const char* what)
+    {
+        if (err != CL_SUCCESS)
+        {
+            throw std::runtime_error(
+                std::string(what) +
+                " failed: " +
+                clErrorString(err) +
+                " (" +
+                std::to_string(err) +
+                ")");
+        }
+    }
+
+    // -----------------------------------------------------------------------------
+    // Build log
+    //
+    // IMPORTANT:
+    // Do not use result.data() here. Older C++/OpenCL header combinations can
+    // expose the argument as void* while std::string::data() is const char*.
+    // &result[0] is writable for a non-empty std::string.
+    // -----------------------------------------------------------------------------
+
+    static std::string getBuildLog(cl_program program, cl_device_id device)
+    {
+        size_t size = 0;
+
+        cl_int err = clGetProgramBuildInfo(
+            program,
+            device,
+            CL_PROGRAM_BUILD_LOG,
+            0,
+            nullptr,
+            &size);
+
+        if (err != CL_SUCCESS || size == 0)
+            return std::string();
+
+        std::string result(size, '\0');
+
+        err = clGetProgramBuildInfo(
+            program,
+            device,
+            CL_PROGRAM_BUILD_LOG,
+            size,
+            &result[0],
+            nullptr);
+
+        if (err != CL_SUCCESS)
+            return std::string();
+
+        return result;
+    }
+
+    // -----------------------------------------------------------------------------
+    // Dynamically obtain clCreateCommandQueueWithProperties.
+    //
+    // This is the important compatibility trick.
+    //
+    // The source can therefore be compiled against OpenCL 1.2 headers, where the
+    // function declaration may not exist, while still using the newer API when the
+    // runtime provides it.
+    //
+    // If the runtime does not expose it, the code falls back to the universally
+    // available OpenCL 1.2 clCreateCommandQueue.
+    // -----------------------------------------------------------------------------
+
+    typedef cl_command_queue(CL_API_CALL* PFN_clCreateCommandQueueWithPropertiesCompat)(
+        cl_context,
+        cl_device_id,
+        const cl_queue_properties*,
+        cl_int*);
+
+    static cl_command_queue createCommandQueueCompat(
+        cl_context context,
+        cl_device_id device,
+        cl_platform_id platform)
+    {
+        cl_int err = CL_SUCCESS;
+
+        PFN_clCreateCommandQueueWithPropertiesCompat createWithProperties =
+            reinterpret_cast<PFN_clCreateCommandQueueWithPropertiesCompat>(
+                clGetExtensionFunctionAddressForPlatform(
+                    platform,
+                    "clCreateCommandQueueWithProperties"));
+
+        if (createWithProperties)
+        {
+            const cl_queue_properties properties[] = {
+                0
+            };
+
+            cl_command_queue queue =
+                createWithProperties(
+                    context,
+                    device,
+                    properties,
+                    &err);
+
+            if (err == CL_SUCCESS && queue)
+                return queue;
+        }
+
+        // OpenCL 1.2 fallback.
+        //
+        // This API is deprecated in newer headers but remains the compatibility
+        // path for older OpenCL implementations.
+        //
+        // We intentionally do not pass profiling or other optional properties.
+        return clCreateCommandQueue(
+            context,
+            device,
+            0,
+            &err);
+    }
+
+    // -----------------------------------------------------------------------------
+    // Offset description
+    // -----------------------------------------------------------------------------
+
+    struct Offset
+    {
+        int dx;
+        int dy;
+    };
+
+    // -----------------------------------------------------------------------------
+    // Generate offsets in EXACTLY the same order as the CPU implementation.
+    //
+    // Existing CPU code:
+    //
+    //     int dx = 1;
+    //
+    //     for (int dy = 0; dy <= radius; ++dy)
+    //     {
+    //         ...
+    //         for (; dx <= radius; ++dx)
+    //         {
+    //             ...
+    //         }
+    //
+    //         dx = -radius;
+    //     }
+    //
+    // Therefore:
+    //
+    //   dy = 0 : dx = 1 ... radius
+    //   dy = 1 : dx = -radius ... radius
+    //   dy = 2 : dx = -radius ... radius
+    //   ...
+    //   dy = radius : dx = -radius ... radius
+    //
+    // This gives:
+    //     radius + radius * 2 + radius
+    //   = (radius + 1) * (2 * radius)
+    //   = (radius + 1) * (K - 1)
+    // -----------------------------------------------------------------------------
+
+    static std::vector<Offset> makeOffsets(int radius)
+    {
+        std::vector<Offset> offsets;
+
+        offsets.reserve(
+            static_cast<size_t>(2 * radius * (radius + 1)));
+
+        for (int dy = 0; dy <= radius; ++dy)
+        {
+            if (dy == 0)
+            {
+                for (int dx = 1; dx <= radius; ++dx)
+                    offsets.push_back({ dx, dy });
+            }
+            else
+            {
+                for (int dx = -radius; dx <= radius; ++dx)
+                    offsets.push_back({ dx, dy });
+            }
+        }
+
+        return offsets;
+    }
+
+    // -----------------------------------------------------------------------------
+    // OpenCL context
+    // -----------------------------------------------------------------------------
+
+    struct Context
+    {
+        cl_platform_id platform = nullptr;
+        cl_device_id device = nullptr;
+        cl_context context = nullptr;
+        cl_command_queue queue = nullptr;
+        cl_program program = nullptr;
+        cl_kernel kernel = nullptr;
+
+        ~Context()
+        {
+            if (kernel)
+                clReleaseKernel(kernel);
+
+            if (program)
+                clReleaseProgram(program);
+
+            if (queue)
+                clReleaseCommandQueue(queue);
+
+            if (context)
+                clReleaseContext(context);
+        }
+    };
+
+    // -----------------------------------------------------------------------------
+    // Select a GPU device.
+    //
+    // If no GPU is available, fall back to any OpenCL device.
+    //
+    // This keeps the function usable on systems where the OpenCL implementation
+    // does not expose a GPU device.
+    // -----------------------------------------------------------------------------
+
+    static bool chooseDevice(
+        cl_platform_id& selectedPlatform,
+        cl_device_id& selectedDevice)
+    {
+        selectedPlatform = nullptr;
+        selectedDevice = nullptr;
+
+        cl_uint platformCount = 0;
+
+        cl_int err = clGetPlatformIDs(
+            0,
+            nullptr,
+            &platformCount);
+
+        if (err != CL_SUCCESS || platformCount == 0)
+            return false;
+
+        std::vector<cl_platform_id> platforms(platformCount);
+
+        err = clGetPlatformIDs(
+            platformCount,
+            platforms.data(),
+            nullptr);
+
+        if (err != CL_SUCCESS)
+            return false;
+
+        // First pass: GPU.
+        for (cl_platform_id platform : platforms)
+        {
+            cl_uint deviceCount = 0;
+
+            err = clGetDeviceIDs(
+                platform,
+                CL_DEVICE_TYPE_GPU,
+                0,
+                nullptr,
+                &deviceCount);
+
+            if (err != CL_SUCCESS || deviceCount == 0)
+                continue;
+
+            std::vector<cl_device_id> devices(deviceCount);
+
+            err = clGetDeviceIDs(
+                platform,
+                CL_DEVICE_TYPE_GPU,
+                deviceCount,
+                devices.data(),
+                nullptr);
+
+            if (err == CL_SUCCESS && !devices.empty())
+            {
+                selectedPlatform = platform;
+                selectedDevice = devices[0];
+                return true;
+            }
+        }
+
+        // Second pass: any device.
+        for (cl_platform_id platform : platforms)
+        {
+            cl_uint deviceCount = 0;
+
+            err = clGetDeviceIDs(
+                platform,
+                CL_DEVICE_TYPE_ALL,
+                0,
+                nullptr,
+                &deviceCount);
+
+            if (err != CL_SUCCESS || deviceCount == 0)
+                continue;
+
+            std::vector<cl_device_id> devices(deviceCount);
+
+            err = clGetDeviceIDs(
+                platform,
+                CL_DEVICE_TYPE_ALL,
+                deviceCount,
+                devices.data(),
+                nullptr);
+
+            if (err == CL_SUCCESS && !devices.empty())
+            {
+                selectedPlatform = platform;
+                selectedDevice = devices[0];
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // -----------------------------------------------------------------------------
+    // Kernel
+    //
+    // One work-group computes one partial 256-bin histogram.
+    //
+    // Work-groups are distributed over:
+    //
+    //     offsetIndex * groupCount + groupIndex
+    //
+    // Each group processes a strided subset of valid pixels.
+    //
+    // A local histogram is used to avoid global atomic contention.
+    //
+    // Only OpenCL 1.2 functionality is used.
+    // -----------------------------------------------------------------------------
+
+    static const char* kernelSource = R"CLC(
+
+__kernel void buildPartialHistograms(
+    __global const uchar* image,
+    const int width,
+    const int height,
+
+    const int xStart,
+    const int yStart,
+    const int validWidth,
+    const int validHeight,
+
+    const int radius,
+
+    __global const int2* offsets,
+    const int offsetCount,
+
+    const int groupCount,
+
+    __global uint* partialHistograms)
+{
+    __local uint histogram[256];
+
+    const uint localId = get_local_id(0);
+    const uint localSize = get_local_size(0);
+
+    // Clear the local histogram.
+    for (uint i = localId; i < 256; i += localSize)
+        histogram[i] = 0;
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const uint groupId = get_group_id(0);
+
+    const uint offsetIndex = groupId / (uint)groupCount;
+    const uint subgroupIndex = groupId % (uint)groupCount;
+
+    if (offsetIndex >= (uint)offsetCount)
+        return;
+
+    const int2 offset = offsets[offsetIndex];
+
+    const int totalPixels = validWidth * validHeight;
+
+    // Work is distributed between work-groups belonging to the same offset.
+    //
+    // This avoids having one giant work-group for a large image and also
+    // produces several independent histograms that can be reduced on CPU.
+    for (
+        int p = (int)subgroupIndex * (int)get_local_size(0)
+              + (int)localId;
+        p < totalPixels;
+        p += groupCount * (int)get_local_size(0))
+    {
+        const int y = p / validWidth + yStart;
+        const int x = p - (p / validWidth) * validWidth + xStart;
+
+        const uchar center = image[y * width + x];
+
+        const int xx = x + offset.x;
+        const int yy = y + offset.y;
+
+        const uchar value = image[yy * width + xx];
+
+        int difference = (int)center - (int)value;
+
+        if (difference < 0)
+            difference = -difference;
+
+        atomic_inc(&histogram[difference]);
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Write this work-group's partial histogram.
+    __global uint* dst =
+        partialHistograms +
+        (offsetIndex * (uint)groupCount + subgroupIndex) * 256u;
+
+    for (uint i = localId; i < 256; i += localSize)
+        dst[i] = histogram[i];
+}
+
+)CLC";
+
+    // -----------------------------------------------------------------------------
+    // Select a reasonable number of groups per offset.
+    //
+    // The result is intentionally modest because every group has a 256-entry
+    // local histogram and produces 1 KB of output.
+    //
+    // For a large image 16-32 groups per offset is generally enough.
+    // -----------------------------------------------------------------------------
+
+    static size_t chooseGroupCount(
+        size_t pixelCount,
+        size_t maxGroups)
+    {
+        if (pixelCount == 0)
+            return 1;
+
+        // Roughly one group per 4096 pixels.
+        size_t groups =
+            std::max<size_t>(
+                1,
+                pixelCount / 4096);
+
+        groups =
+            std::min(
+                groups,
+                maxGroups);
+
+        return std::max<size_t>(1, groups);
+    }
+
+    // -----------------------------------------------------------------------------
+    // Determine a legal work-group size.
+    //
+    // OpenCL implementations have different limits. 256 is convenient for the
+    // 256-bin histogram, but we do not require it.
+    // -----------------------------------------------------------------------------
+
+    static size_t chooseLocalSize(
+        cl_device_id device,
+        cl_kernel kernel)
+    {
+        size_t deviceLimit = 1;
+        size_t kernelLimit = 1;
+
+        clGetDeviceInfo(
+            device,
+            CL_DEVICE_MAX_WORK_GROUP_SIZE,
+            sizeof(deviceLimit),
+            &deviceLimit,
+            nullptr);
+
+        clGetKernelWorkGroupInfo(
+            kernel,
+            device,
+            CL_KERNEL_WORK_GROUP_SIZE,
+            sizeof(kernelLimit),
+            &kernelLimit,
+            nullptr);
+
+        size_t limit =
+            std::min(
+                deviceLimit,
+                kernelLimit);
+
+        if (limit >= 256)
+            return 256;
+
+        if (limit >= 128)
+            return 128;
+
+        if (limit >= 64)
+            return 64;
+
+        if (limit >= 32)
+            return 32;
+
+        if (limit >= 16)
+            return 16;
+
+        if (limit >= 8)
+            return 8;
+
+        if (limit >= 4)
+            return 4;
+
+        if (limit >= 2)
+            return 2;
+
+        return 1;
+    }
+
+    // -----------------------------------------------------------------------------
+    // Main implementation
+    // -----------------------------------------------------------------------------
+
+    static Mat computeMaxDiffMatrixOpenCLImpl(
+        const Mat& gray,
+        int radius)
+    {
+        CV_Assert(!gray.empty());
+        CV_Assert(gray.type() == CV_8U);
+        CV_Assert(radius >= 1);
+
+        const int K = radius * 2 + 1;
+
+        // Same definition as the CPU implementation.
+        const int border = 2;
+
+        const int yStart = border;
+        const int yEnd =
+            gray.rows - border - radius;
+
+        const int xStart =
+            border + radius;
+
+        const int xEnd =
+            gray.cols - border - radius;
+
+        if (yEnd <= yStart || xEnd <= xStart)
+        {
+            // Match the practical behavior expected from the CPU path for an
+            // image that has no valid sample region.
+            Mat result = Mat::zeros(
+                K,
+                K,
+                CV_32F);
+
+            return result;
+        }
+
+        const int validWidth =
+            xEnd - xStart;
+
+        const int validHeight =
+            yEnd - yStart;
+
+        const size_t pixelCount =
+            static_cast<size_t>(validWidth) *
+            static_cast<size_t>(validHeight);
+
+        const std::vector<Offset> offsets =
+            makeOffsets(radius);
+
+        const int offsetCount =
+            static_cast<int>(offsets.size());
+
+        // CPU code has:
+        //
+        //     binsSize = (K - 1) * (radius + 1)
+        //
+        // which is identical to offsetCount.
+        const int binsSize =
+            (K - 1) * (radius + 1);
+
+        CV_Assert(offsetCount == binsSize);
+
+        // -------------------------------------------------------------------------
+        // OpenCL setup
+        // -------------------------------------------------------------------------
+
+        Context cl;
+
+        if (!chooseDevice(cl.platform, cl.device))
+            throw std::runtime_error(
+                "No OpenCL device available");
+
+        cl_int err = CL_SUCCESS;
+
+        cl.context =
+            clCreateContext(
+                nullptr,
+                1,
+                &cl.device,
+                nullptr,
+                nullptr,
+                &err);
+
+        checkCL(
+            err,
+            "clCreateContext");
+
+        cl.queue =
+            createCommandQueueCompat(
+                cl.context,
+                cl.device,
+                cl.platform);
+
+        if (!cl.queue)
+        {
+            throw std::runtime_error(
+                "Unable to create OpenCL command queue");
+        }
+
+        // -------------------------------------------------------------------------
+        // Program
+        // -------------------------------------------------------------------------
+
+        const char* source =
+            kernelSource;
+
+        const size_t sourceLength =
+            std::strlen(source);
+
+        cl.program =
+            clCreateProgramWithSource(
+                cl.context,
+                1,
+                &source,
+                &sourceLength,
+                &err);
+
+        checkCL(
+            err,
+            "clCreateProgramWithSource");
+
+        err =
+            clBuildProgram(
+                cl.program,
+                1,
+                &cl.device,
+                nullptr,
+                nullptr,
+                nullptr);
+
+        if (err != CL_SUCCESS)
+        {
+            const std::string log =
+                getBuildLog(
+                    cl.program,
+                    cl.device);
+
+            throw std::runtime_error(
+                std::string("OpenCL kernel build failed: ") +
+                clErrorString(err) +
+                "\n" +
+                log);
+        }
+
+        cl.kernel =
+            clCreateKernel(
+                cl.program,
+                "buildPartialHistograms",
+                &err);
+
+        checkCL(
+            err,
+            "clCreateKernel");
+
+        // -------------------------------------------------------------------------
+        // Upload image.
+        //
+        // The CPU implementation accesses gray as a continuous logical image.
+        // If the input is not continuous, make a compact copy.
+        // -------------------------------------------------------------------------
+
+        Mat compact;
+
+        if (gray.isContinuous())
+            compact = gray;
+        else
+            gray.copyTo(compact);
+
+        const size_t imageBytes =
+            compact.total() *
+            sizeof(uchar);
+
+        cl_mem imageBuffer =
+            clCreateBuffer(
+                cl.context,
+                CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                imageBytes,
+                compact.data,
+                &err);
+
+        checkCL(
+            err,
+            "clCreateBuffer(image)");
+
+        // -------------------------------------------------------------------------
+        // Upload offsets.
+        // -------------------------------------------------------------------------
+
+        std::vector<cl_int2> clOffsets(
+            offsets.size());
+
+        for (size_t i = 0; i < offsets.size(); ++i)
+        {
+            clOffsets[i].s[0] =
+                static_cast<cl_int>(
+                    offsets[i].dx);
+
+            clOffsets[i].s[1] =
+                static_cast<cl_int>(
+                    offsets[i].dy);
+        }
+
+        cl_mem offsetBuffer =
+            clCreateBuffer(
+                cl.context,
+                CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                clOffsets.size() *
+                sizeof(cl_int2),
+                clOffsets.data(),
+                &err);
+
+        checkCL(
+            err,
+            "clCreateBuffer(offsets)");
+
+        // -------------------------------------------------------------------------
+        // Work-group configuration.
+        // -------------------------------------------------------------------------
+
+        const size_t groupCount =
+            chooseGroupCount(
+                pixelCount,
+                32);
+
+        const size_t localSize =
+            chooseLocalSize(
+                cl.device,
+                cl.kernel);
+
+        const size_t totalGroups =
+            static_cast<size_t>(offsetCount) *
+            groupCount;
+
+        const size_t globalSize =
+            totalGroups *
+            localSize;
+
+        // Each work-group creates 256 uint32 histogram entries.
+        //
+        // Layout:
+        //
+        //     [offset][group][difference]
+        //
+        // where difference = 0..255.
+        //
+        const size_t partialHistogramEntries =
+            totalGroups * 256;
+
+        const size_t partialHistogramBytes =
+            partialHistogramEntries *
+            sizeof(uint32_t);
+
+        cl_mem partialHistogramBuffer =
+            clCreateBuffer(
+                cl.context,
+                CL_MEM_WRITE_ONLY,
+                partialHistogramBytes,
+                nullptr,
+                &err);
+
+        checkCL(
+            err,
+            "clCreateBuffer(partialHistograms)");
+
+        // -------------------------------------------------------------------------
+        // Kernel arguments
+        // -------------------------------------------------------------------------
+
+        const int width =
+            compact.cols;
+
+        const int height =
+            compact.rows;
+
+        const int groupCountInt =
+            static_cast<int>(groupCount);
+
+        checkCL(
+            clSetKernelArg(
+                cl.kernel,
+                0,
+                sizeof(cl_mem),
+                &imageBuffer),
+            "clSetKernelArg(image)");
+
+        checkCL(
+            clSetKernelArg(
+                cl.kernel,
+                1,
+                sizeof(int),
+                &width),
+            "clSetKernelArg(width)");
+
+        checkCL(
+            clSetKernelArg(
+                cl.kernel,
+                2,
+                sizeof(int),
+                &height),
+            "clSetKernelArg(height)");
+
+        checkCL(
+            clSetKernelArg(
+                cl.kernel,
+                3,
+                sizeof(int),
+                &xStart),
+            "clSetKernelArg(xStart)");
+
+        checkCL(
+            clSetKernelArg(
+                cl.kernel,
+                4,
+                sizeof(int),
+                &yStart),
+            "clSetKernelArg(yStart)");
+
+        checkCL(
+            clSetKernelArg(
+                cl.kernel,
+                5,
+                sizeof(int),
+                &validWidth),
+            "clSetKernelArg(validWidth)");
+
+        checkCL(
+            clSetKernelArg(
+                cl.kernel,
+                6,
+                sizeof(int),
+                &validHeight),
+            "clSetKernelArg(validHeight)");
+
+        checkCL(
+            clSetKernelArg(
+                cl.kernel,
+                7,
+                sizeof(int),
+                &radius),
+            "clSetKernelArg(radius)");
+
+        checkCL(
+            clSetKernelArg(
+                cl.kernel,
+                8,
+                sizeof(cl_mem),
+                &offsetBuffer),
+            "clSetKernelArg(offsets)");
+
+        checkCL(
+            clSetKernelArg(
+                cl.kernel,
+                9,
+                sizeof(int),
+                &offsetCount),
+            "clSetKernelArg(offsetCount)");
+
+        checkCL(
+            clSetKernelArg(
+                cl.kernel,
+                10,
+                sizeof(int),
+                &groupCountInt),
+            "clSetKernelArg(groupCount)");
+
+        checkCL(
+            clSetKernelArg(
+                cl.kernel,
+                11,
+                sizeof(cl_mem),
+                &partialHistogramBuffer),
+            "clSetKernelArg(partialHistograms)");
+
+        // -------------------------------------------------------------------------
+        // Execute.
+        // -------------------------------------------------------------------------
+
+        err =
+            clEnqueueNDRangeKernel(
+                cl.queue,
+                cl.kernel,
+                1,
+                nullptr,
+                &globalSize,
+                &localSize,
+                0,
+                nullptr,
+                nullptr);
+
+        checkCL(
+            err,
+            "clEnqueueNDRangeKernel");
+
+        checkCL(
+            clFinish(cl.queue),
+            "clFinish");
+
+        // -------------------------------------------------------------------------
+        // Download partial histograms.
+        // -------------------------------------------------------------------------
+
+        std::vector<uint32_t> partialHistograms(
+            partialHistogramEntries);
+
+        checkCL(
+            clEnqueueReadBuffer(
+                cl.queue,
+                partialHistogramBuffer,
+                CL_TRUE,
+                0,
+                partialHistogramBytes,
+                partialHistograms.data(),
+                0,
+                nullptr,
+                nullptr),
+            "clEnqueueReadBuffer");
+
+        // Release temporary buffers before CPU processing.
+        clReleaseMemObject(partialHistogramBuffer);
+        clReleaseMemObject(offsetBuffer);
+        clReleaseMemObject(imageBuffer);
+
+        // -------------------------------------------------------------------------
+        // Reduce partial histograms on CPU.
+        //
+        // Result layout is exactly:
+        //
+        //     bins[offset][difference]
+        //
+        // matching the existing CPU implementation.
+        // -------------------------------------------------------------------------
+
+        const int binsLength =
+            binsSize * 256;
+
+        std::vector<uint32_t> bins(
+            static_cast<size_t>(binsLength),
+            0);
+
+        for (int offsetIndex = 0;
+            offsetIndex < binsSize;
+            ++offsetIndex)
+        {
+            uint32_t* destination =
+                bins.data() +
+                static_cast<size_t>(offsetIndex) * 256;
+
+            for (size_t groupIndex = 0;
+                groupIndex < groupCount;
+                ++groupIndex)
+            {
+                const uint32_t* source =
+                    partialHistograms.data() +
+                    (
+                        static_cast<size_t>(offsetIndex) *
+                        groupCount +
+                        groupIndex
+                        ) * 256;
+
+                for (int d = 0; d < 256; ++d)
+                {
+                    destination[d] +=
+                        source[d];
+                }
+            }
+        }
+
+        // -------------------------------------------------------------------------
+        // Exact same top-1% extraction as CPU implementation.
+        // -------------------------------------------------------------------------
+
+        const int nth =
+            std::max(
+                1,
+                (gray.rows * gray.cols) / 100);
+
+        std::vector<float> values;
+        values.reserve(
+            static_cast<size_t>(binsSize));
+
+        for (int offsetIndex = 0;
+            offsetIndex < binsSize;
+            ++offsetIndex)
+        {
+            const uint32_t* histogram =
+                bins.data() +
+                static_cast<size_t>(offsetIndex) * 256;
+
+            uint64_t sum = 0;
+            uint64_t count = 0;
+
+            // Same descending difference order.
+            for (int d = 255;
+                d >= 0 && count < static_cast<uint64_t>(nth);
+                --d)
+            {
+                const uint32_t n =
+                    histogram[d];
+
+                if (n == 0)
+                    continue;
+
+                const uint64_t remaining =
+                    static_cast<uint64_t>(nth) -
+                    count;
+
+                const uint64_t take =
+                    std::min<uint64_t>(
+                        n,
+                        remaining);
+
+                sum +=
+                    static_cast<uint64_t>(d) *
+                    take;
+
+                count += take;
+            }
+
+            if (count != 0)
+            {
+                values.push_back(
+                    static_cast<float>(
+                        static_cast<double>(sum) /
+                        static_cast<double>(count)));
+            }
+            else
+            {
+                values.push_back(0.0f);
+            }
+        }
+
+        // -------------------------------------------------------------------------
+        // Reconstruct M exactly as the CPU implementation.
+        //
+        // allValues =
+        //
+        //     reverse(values),
+        //     0,
+        //     values
+        //
+        // giving K*K entries.
+        // -------------------------------------------------------------------------
+
+        std::vector<float> allValues;
+
+        allValues.reserve(
+            static_cast<size_t>(K) *
+            static_cast<size_t>(K));
+
+        for (auto it = values.rbegin();
+            it != values.rend();
+            ++it)
+        {
+            allValues.push_back(*it);
+        }
+
+        allValues.push_back(0.0f);
+
+        for (float value : values)
+            allValues.push_back(value);
+
+        CV_Assert(
+            allValues.size() ==
+            static_cast<size_t>(K) *
+            static_cast<size_t>(K));
+
+        Mat M(
+            K,
+            K,
+            CV_32F,
+            allValues.data());
+
+        M = M.clone();
+
+        // -------------------------------------------------------------------------
+        // Same normalization as CPU implementation.
+        // -------------------------------------------------------------------------
+
+        double mn = 0.0;
+        double mx = 0.0;
+
+        minMaxLoc(
+            M,
+            &mn,
+            &mx);
+
+        Mat P =
+            Mat::zeros(
+                M.size(),
+                M.type());
+
+        if (mx - mn > 1e-12)
+        {
+            P =
+                (mx - M) /
+                static_cast<float>(mx - mn);
+        }
+
+        // -------------------------------------------------------------------------
+        // Same unit-sum normalization used by the CPU path.
+        //
+        // This is written locally so this implementation does not depend on
+        // MaxDiffOpenCL namespace visibility of the existing helper.
+        // -------------------------------------------------------------------------
+
+        const double total =
+            sum(P)[0];
+
+        if (std::abs(total) > 1e-12)
+        {
+            P /=
+                static_cast<float>(total);
+        }
+
+        return P;
+    }
+
+    // -----------------------------------------------------------------------------
+    // Public entry point
+    //
+    // Returns an empty Mat on OpenCL failure so the caller can choose to fall back
+    // to the existing CPU implementation.
+    //
+    // If you prefer exceptions instead, remove the try/catch below.
+    // -----------------------------------------------------------------------------
+
+    Mat computeMaxDiffMatrixOpenCL(
+        const Mat& gray,
+        int radius)
+    {
+        try
+        {
+            return computeMaxDiffMatrixOpenCLImpl(
+                gray,
+                radius);
+        }
+        catch (const std::exception&)
+        {
+            // OpenCL is an optional acceleration path.
+            //
+            // The caller should normally fall back to:
+            //
+            //     computeMaxDiffMatrix(gray, radius)
+            //
+            // rather than making image processing fail merely because OpenCL is
+            // unavailable or its driver has a problem.
+            return Mat();
+        }
+    }
+
+} // namespace MaxDiffOpenCL
+
 //============================================================
 // Helpers
 //============================================================
@@ -514,8 +1770,15 @@ Mat deblurChannel(const Mat& gray)
     gray.convertTo(Y, CV_32F);
 
     const int radius = 15;
+    //*
+    Mat M = MaxDiffOpenCL::computeMaxDiffMatrixOpenCL(gray, radius);
 
-    Mat M = computeMaxDiffMatrix(gray, radius) + computeCorrelationFFT(Y, radius);
+    if (M.empty())
+        M = computeMaxDiffMatrix(gray, radius);
+
+    //M += computeCorrelationFFT(Y, radius);
+    //*/
+    //Mat M = computeMaxDiffMatrix(gray, radius) + computeCorrelationFFT(Y, radius);
     Mat psf = buildPSFFromM(M);
     Mat G = buildInverseFilterFromPSF(psf, Y.size(), 0.1f);
 
