@@ -1800,6 +1800,140 @@ Mat deblurChannel(const Mat& gray)
     return applyFilterDFT(F, G);
 }
 
+//////////////////////////////////////////////////////////////////////////////
+
+cv::Mat getMinimalGaussianTarget(int size, float sigma = 0.85f) {
+    cv::Mat R(size, size, CV_32FC1);
+    int center = size / 2;
+    float sum = 0.0f;
+
+    for (int y = 0; y < size; ++y) {
+        for (int x = 0; x < size; ++x) {
+            float dy = static_cast<float>(y - center);
+            float dx = static_cast<float>(x - center);
+            float val = std::exp(-0.5f * (dx * dx + dy * dy) / (sigma * sigma));
+            R.at<float>(y, x) = val;
+            sum += val;
+        }
+    }
+    return R / sum; // Нармалізацыя энергіі
+}
+
+// Функцыя генерацыі ядра для cv::filter2D на аснове логікі MCS
+cv::Mat generateMCSFilter2DKernel(const cv::Mat& diffusionMatrix, float noiseReg = 0.005f, int kernelSize = 15) {
+    if (kernelSize % 2 == 0) kernelSize++; // Памер павінен быць няцотным
+
+    // 1. Падрыхтоўка і падгонка памеру матрыцы дыфузіі (T)
+    cv::Mat T_padded = cv::Mat::zeros(kernelSize, kernelSize, CV_32FC1);
+    int padY = (kernelSize - diffusionMatrix.rows) / 2;
+    int padX = (kernelSize - diffusionMatrix.cols) / 2;
+
+    cv::Mat roi = T_padded(cv::Rect(padX, padY, diffusionMatrix.cols, diffusionMatrix.rows));
+    diffusionMatrix.convertTo(roi, CV_32F);
+    T_padded /= cv::sum(T_padded)[0]; // Нармалізацыя
+
+    // 2. Стварэнне мэтавага ядра мінімальнага Гаўса (R)
+    cv::Mat R = getMinimalGaussianTarget(kernelSize, 0.85f);
+
+    // 3. Зрух цэнтраў для карэктнага DFT (цыклічны зрух)
+    auto shiftDFT = [](const cv::Mat& src, cv::Mat& dst) {
+        dst = src.clone();
+        int cx = dst.cols / 2;
+        int cy = dst.rows / 2;
+        cv::Mat q0(dst, cv::Rect(0, 0, cx, cy));
+        cv::Mat q1(dst, cv::Rect(cx, 0, cx, cy));
+        cv::Mat q2(dst, cv::Rect(0, cy, cx, cy));
+        cv::Mat q3(dst, cv::Rect(cx, cy, cx, cy));
+        cv::Mat tmp;
+        q0.copyTo(tmp); q3.copyTo(q0); tmp.copyTo(q3);
+        q1.copyTo(tmp); q2.copyTo(q1); tmp.copyTo(q2);
+        };
+
+    cv::Mat T_shifted, R_shifted;
+    shiftDFT(T_padded, T_shifted);
+    shiftDFT(R, R_shifted);
+
+    // 4. Перавод у частатную вобласць (DFT)
+    cv::Mat T_fft, R_fft;
+    cv::dft(T_shifted, T_fft, cv::DFT_COMPLEX_OUTPUT);
+    cv::dft(R_shifted, R_fft, cv::DFT_COMPLEX_OUTPUT);
+
+    // Split на рэальную і ўяўную часткі
+    cv::Mat T_planes[2], R_planes[2];
+    cv::split(T_fft, T_planes);
+    cv::split(R_fft, R_planes);
+
+    // Вылічэнне H = T / R (у частатнай вобласці)
+    // Каб пазбегнуць дзялення на нуль, дадаем невялікую канстанту 1e-8
+    cv::Mat R_denom = R_planes[0].mul(R_planes[0]) + R_planes[1].mul(R_planes[1]) + 1e-8f;
+    cv::Mat H_re = (T_planes[0].mul(R_planes[0]) + T_planes[1].mul(R_planes[1])) / R_denom;
+    cv::Mat H_im = (T_planes[1].mul(R_planes[0]) - T_planes[0].mul(R_planes[1])) / R_denom;
+
+    // 5. Стабілізацыя Вінера-MCS для аднакрокавай інверсіі
+    cv::Mat H_denom = H_re.mul(H_re) + H_im.mul(H_im) + noiseReg;
+    cv::Mat K_re = H_re / H_denom;
+    cv::Mat K_im = -H_im / H_denom; // Спражэнне (Conjugate)
+
+    cv::Mat K_fft;
+    cv::Mat K_planes[] = { K_re, K_im };
+    cv::merge(K_planes, 2, K_fft);
+
+    // 6. Зваротнае пераўтварэнне ў прасторавую вобласць (IDFT)
+    cv::Mat K_spatial_shifted;
+    cv::idft(K_fft, K_spatial_shifted, cv::DFT_SCALE | cv::DFT_REAL_OUTPUT);
+
+    // Вяртаем цэнтр ядра на месца
+    cv::Mat K_spatial;
+    shiftDFT(K_spatial_shifted, K_spatial);
+
+    return K_spatial;
+}
+
+Mat deblurChannelMCS(const Mat& gray)
+{
+    Mat Y;
+    gray.convertTo(Y, CV_32F);
+
+    const int radius = 15;
+    /*
+    Mat M = MaxDiffOpenCL::computeMaxDiffMatrixOpenCL(gray, radius);
+
+    if (M.empty())
+        M = computeMaxDiffMatrix(gray, radius);
+
+    //M += computeCorrelationFFT(Y, radius);
+    //*/
+
+    Mat M = computeCorrelationFFT(Y, radius);
+
+    //Mat M = computeMaxDiffMatrix(gray, radius);
+
+
+    Mat psf = buildPSFFromM(M);
+    //Mat G = buildInverseFilterFromPSF(psf, Y.size(), 0.1f);
+
+    // Рэгулярызацыя шуму: чым больш шум на фота, тым вышэй павінна быць лічба (напр. 0.01)
+    float noiseReg = 0.005f;
+
+    // Генеруем ядро для фільтрацыі (памер 15х15 дастаткова шырокі для плаўнага згасання)
+    cv::Mat mcsKernel = generateMCSFilter2DKernel(psf, noiseReg, 31);
+
+    // Ужыванне фільтра
+    cv::Mat dst;
+    // BORDER_REPLICATE вельмі важны для мінімізацыі артэфактаў на краях кадра
+    cv::filter2D(gray, dst, CV_32F, mcsKernel, cv::Point(-1, -1), 0, cv::BORDER_REPLICATE);
+
+    // Канвертуем назад у стандартны 8-бітны фармат выявы
+    dst.convertTo(dst, CV_8U);
+
+    return dst;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+
+
+
 int main(int argc, char** argv)
 {
     if (argc < 3)
@@ -1821,7 +1955,10 @@ int main(int argc, char** argv)
     Mat Cb = ch[2];
 
     auto start = std::chrono::high_resolution_clock::now();
-    ch[0] = deblurChannel(ch[0]);
+
+    //ch[0] = deblurChannel(ch[0]);
+    ch[0] = deblurChannelMCS(ch[0]);
+
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end - start;
     std::cout << "Processing time: " << elapsed.count() << " seconds\n";
